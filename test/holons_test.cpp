@@ -654,11 +654,32 @@ int main() {
     ++passed;
     assert(capture.find("ARG1=./cmd/echo-server") != std::string::npos);
     ++passed;
-    assert(capture.find("--sdk") != std::string::npos &&
-           capture.find("cpp-holons") != std::string::npos);
+    assert(capture.find("ARG2=--sdk") != std::string::npos &&
+           capture.find("ARG3=cpp-holons") != std::string::npos);
     ++passed;
-    assert(capture.find("--listen") != std::string::npos &&
-           capture.find("stdio://") != std::string::npos);
+    assert(capture.find("ARG4=--listen") != std::string::npos &&
+           capture.find("ARG5=stdio://") != std::string::npos);
+    ++passed;
+
+    server_exit = command_exit_code(
+        "./bin/echo-server serve --listen stdio:// >/dev/null 2>&1");
+    assert(server_exit == 0);
+    ++passed;
+
+    capture = read_file_text(fake_log);
+    assert(!capture.empty());
+    ++passed;
+    assert(capture.find("ARG0=run") != std::string::npos);
+    ++passed;
+    assert(capture.find("ARG1=./cmd/echo-server") != std::string::npos);
+    ++passed;
+    assert(capture.find("ARG2=serve") != std::string::npos);
+    ++passed;
+    assert(capture.find("ARG3=--sdk") != std::string::npos &&
+           capture.find("ARG4=cpp-holons") != std::string::npos);
+    ++passed;
+    assert(capture.find("ARG5=--listen") != std::string::npos &&
+           capture.find("ARG6=stdio://") != std::string::npos);
     ++passed;
 
     if (had_prev_go_bin) {
