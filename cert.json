@@ -13,17 +13,20 @@
     "grpc_listen_mem": true,
     "grpc_dial_tcp": true,
     "grpc_dial_stdio": true,
-    "grpc_dial_unix": false,
+    "grpc_dial_unix": true,
     "grpc_dial_ws": false,
     "holon_rpc_client": true,
     "holon_rpc_server": false,
     "bidirectional": true,
     "valence": "multi",
-    "routing": ["unicast"]
+    "routing": [
+      "unicast",
+      "fanout"
+    ]
   },
   "last_certified": {
-    "commit": "b7a4579cbd7a42b3a81f47bb3d193d7455d3d6a4",
+    "commit": "895066c3b5340601cdc5824ddc7ab2a21e3779ab",
     "date": "2026-02-14",
-    "level": 0
+    "level": 2
   }
 }
