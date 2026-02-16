@@ -24,9 +24,9 @@
   },
   "lang": "cpp",
   "last_certified": {
-    "commit": "e6a62935b2fac54902ad55bfc68d1e6dad5a657e",
-    "date": "2026-02-15",
-    "level": 4
+    "commit": "3b9d426f239d81b8c8f3eca55ee494c22e22252b",
+    "date": "2026-02-16",
+    "level": 5
   },
   "role": "client",
   "sdk": "cpp-holons",
