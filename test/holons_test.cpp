@@ -204,6 +204,40 @@ int command_exit_code(const std::string &cmd) {
   return WEXITSTATUS(status);
 }
 
+int run_bash_script(const std::string &script_body) {
+  char path[] = "/tmp/holons_cpp_script_XXXXXX";
+  int fd = ::mkstemp(path);
+  if (fd < 0) {
+    return -1;
+  }
+
+  FILE *script = ::fdopen(fd, "w");
+  if (script == nullptr) {
+    ::close(fd);
+    ::unlink(path);
+    return -1;
+  }
+
+  std::fputs("#!/usr/bin/env bash\n", script);
+  std::fputs("set -euo pipefail\n", script);
+  std::fputs(script_body.c_str(), script);
+  if (std::ferror(script)) {
+    std::fclose(script);
+    ::unlink(path);
+    return -1;
+  }
+  std::fclose(script);
+
+  if (::chmod(path, 0700) != 0) {
+    ::unlink(path);
+    return -1;
+  }
+
+  int rc = command_exit_code(path);
+  ::unlink(path);
+  return rc;
+}
+
 const char *kGoHolonRPCServerSource = R"GO(
 package main
 
@@ -635,6 +669,8 @@ int main() {
     ++passed;
     assert(raw.find("\"grpc_dial_ws\": true") != std::string::npos);
     ++passed;
+    assert(raw.find("\"grpc_reject_oversize\": true") != std::string::npos);
+    ++passed;
     assert(raw.find("\"holon_rpc_server\": true") != std::string::npos);
     ++passed;
   }
@@ -738,13 +774,19 @@ int main() {
     ++passed;
     assert(capture.find("ARG0=run") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG1=./cmd/echo-server") != std::string::npos);
+    assert(capture.find("echo-server-go/main.go") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG2=--sdk") != std::string::npos &&
-           capture.find("ARG3=cpp-holons") != std::string::npos);
+    assert(capture.find("--sdk") != std::string::npos &&
+           capture.find("cpp-holons") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG4=--listen") != std::string::npos &&
-           capture.find("ARG5=stdio://") != std::string::npos);
+    assert(capture.find("--max-recv-bytes") != std::string::npos &&
+           capture.find("1572864") != std::string::npos);
+    ++passed;
+    assert(capture.find("--max-send-bytes") != std::string::npos &&
+           capture.find("1572864") != std::string::npos);
+    ++passed;
+    assert(capture.find("--listen") != std::string::npos &&
+           capture.find("stdio://") != std::string::npos);
     ++passed;
 
     server_exit = command_exit_code(
@@ -757,15 +799,21 @@ int main() {
     ++passed;
     assert(capture.find("ARG0=run") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG1=./cmd/echo-server") != std::string::npos);
+    assert(capture.find("echo-server-go/main.go") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG2=serve") != std::string::npos);
+    assert(capture.find("serve") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG3=--sdk") != std::string::npos &&
-           capture.find("ARG4=cpp-holons") != std::string::npos);
+    assert(capture.find("--sdk") != std::string::npos &&
+           capture.find("cpp-holons") != std::string::npos);
     ++passed;
-    assert(capture.find("ARG5=--listen") != std::string::npos &&
-           capture.find("ARG6=stdio://") != std::string::npos);
+    assert(capture.find("--max-recv-bytes") != std::string::npos &&
+           capture.find("1572864") != std::string::npos);
+    ++passed;
+    assert(capture.find("--max-send-bytes") != std::string::npos &&
+           capture.find("1572864") != std::string::npos);
+    ++passed;
+    assert(capture.find("--listen") != std::string::npos &&
+           capture.find("stdio://") != std::string::npos);
     ++passed;
 
     int holonrpc_exit = command_exit_code(
@@ -825,6 +873,131 @@ int main() {
           "./bin/echo-client --server-sdk cpp-holons --message cert-ws "
           "ws://127.0.0.1:0/grpc >/dev/null 2>&1");
       assert(ws_exit == 0);
+      ++passed;
+    }
+  }
+
+  // --- resilience probes (L5) ---
+  if (bind_restricted) {
+    std::fprintf(stderr, "SKIP: graceful shutdown probe (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+    std::fprintf(stderr, "SKIP: timeout propagation probe (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+    std::fprintf(stderr, "SKIP: oversized message rejection probe (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+  } else {
+    auto go = resolve_go_binary();
+
+    {
+      char script[8192];
+      std::snprintf(
+          script, sizeof(script),
+          "cleanup() {\n"
+          "  if [ -n \"${S_PID:-}\" ] && kill -0 \"$S_PID\" >/dev/null 2>&1; then\n"
+          "    kill -TERM \"$S_PID\" >/dev/null 2>&1 || true\n"
+          "    wait \"$S_PID\" >/dev/null 2>&1 || true\n"
+          "  fi\n"
+          "}\n"
+          "trap cleanup EXIT\n"
+          "S_OUT=$(mktemp)\n"
+          "S_ERR=$(mktemp)\n"
+          "./bin/echo-server --sleep-ms 1200 --listen tcp://127.0.0.1:0 >\"$S_OUT\" 2>\"$S_ERR\" &\n"
+          "S_PID=$!\n"
+          "ADDR=\"\"\n"
+          "for _ in $(seq 1 120); do\n"
+          "  if [ -s \"$S_OUT\" ]; then\n"
+          "    ADDR=$(head -n1 \"$S_OUT\" | tr -d '\\r\\n')\n"
+          "    if [ -n \"$ADDR\" ]; then break; fi\n"
+          "  fi\n"
+          "  sleep 0.05\n"
+          "done\n"
+          "[ -n \"$ADDR\" ]\n"
+          "(cd ../go-holons && '%s' run ./cmd/echo-client --server-sdk cpp-holons --timeout-ms 5000 --message cert-l5-graceful \"$ADDR\" >/dev/null 2>&1) &\n"
+          "C_PID=$!\n"
+          "sleep 0.2\n"
+          "kill -TERM \"$S_PID\"\n"
+          "wait \"$C_PID\"\n"
+          "wait \"$S_PID\"\n"
+          "trap - EXIT\n",
+          go.c_str());
+      assert(run_bash_script(script) == 0);
+      ++passed;
+    }
+
+    {
+      char script[12288];
+      std::snprintf(
+          script, sizeof(script),
+          "cleanup() {\n"
+          "  if [ -n \"${S_PID:-}\" ] && kill -0 \"$S_PID\" >/dev/null 2>&1; then\n"
+          "    kill -TERM \"$S_PID\" >/dev/null 2>&1 || true\n"
+          "    wait \"$S_PID\" >/dev/null 2>&1 || true\n"
+          "  fi\n"
+          "}\n"
+          "trap cleanup EXIT\n"
+          "S_OUT=$(mktemp)\n"
+          "S_ERR=$(mktemp)\n"
+          "./bin/echo-server --sleep-ms 5000 --listen tcp://127.0.0.1:0 >\"$S_OUT\" 2>\"$S_ERR\" &\n"
+          "S_PID=$!\n"
+          "ADDR=\"\"\n"
+          "for _ in $(seq 1 120); do\n"
+          "  if [ -s \"$S_OUT\" ]; then\n"
+          "    ADDR=$(head -n1 \"$S_OUT\" | tr -d '\\r\\n')\n"
+          "    if [ -n \"$ADDR\" ]; then break; fi\n"
+          "  fi\n"
+          "  sleep 0.05\n"
+          "done\n"
+          "[ -n \"$ADDR\" ]\n"
+          "TIME_OUT=$(mktemp)\n"
+          "TIME_ERR=$(mktemp)\n"
+          "set +e\n"
+          "(cd ../go-holons && '%s' run ./cmd/echo-client --server-sdk cpp-holons --timeout-ms 2000 --message cert-l5-timeout \"$ADDR\" >\"$TIME_OUT\" 2>\"$TIME_ERR\")\n"
+          "TIME_RC=$?\n"
+          "set -e\n"
+          "[ \"$TIME_RC\" -ne 0 ]\n"
+          "grep -Eiq 'DeadlineExceeded|deadline exceeded' \"$TIME_ERR\"\n"
+          "(cd ../go-holons && '%s' run ./cmd/echo-client --server-sdk cpp-holons --timeout-ms 8000 --message cert-l5-timeout-followup \"$ADDR\" >/dev/null 2>&1)\n"
+          "kill -TERM \"$S_PID\"\n"
+          "wait \"$S_PID\"\n"
+          "trap - EXIT\n",
+          go.c_str(), go.c_str());
+      assert(run_bash_script(script) == 0);
+      ++passed;
+    }
+
+    {
+      char script[8192];
+      std::snprintf(
+          script, sizeof(script),
+          "cleanup() {\n"
+          "  if [ -n \"${S_PID:-}\" ] && kill -0 \"$S_PID\" >/dev/null 2>&1; then\n"
+          "    kill -TERM \"$S_PID\" >/dev/null 2>&1 || true\n"
+          "    wait \"$S_PID\" >/dev/null 2>&1 || true\n"
+          "  fi\n"
+          "}\n"
+          "trap cleanup EXIT\n"
+          "S_OUT=$(mktemp)\n"
+          "S_ERR=$(mktemp)\n"
+          "./bin/echo-server --listen tcp://127.0.0.1:0 >\"$S_OUT\" 2>\"$S_ERR\" &\n"
+          "S_PID=$!\n"
+          "ADDR=\"\"\n"
+          "for _ in $(seq 1 120); do\n"
+          "  if [ -s \"$S_OUT\" ]; then\n"
+          "    ADDR=$(head -n1 \"$S_OUT\" | tr -d '\\r\\n')\n"
+          "    if [ -n \"$ADDR\" ]; then break; fi\n"
+          "  fi\n"
+          "  sleep 0.05\n"
+          "done\n"
+          "[ -n \"$ADDR\" ]\n"
+          "(cd ../go-holons && '%s' run ../cpp-holons/test/go_large_ping.go \"$ADDR\" >/dev/null 2>&1)\n"
+          "kill -TERM \"$S_PID\"\n"
+          "wait \"$S_PID\"\n"
+          "trap - EXIT\n",
+          go.c_str());
+      assert(run_bash_script(script) == 0);
       ++passed;
     }
   }

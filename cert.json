@@ -1,33 +1,34 @@
 {
-  "sdk": "cpp-holons",
-  "lang": "cpp",
-  "version": "0.1.0",
-  "executables": {
-    "echo_server": "./bin/echo-server",
-    "echo_client": "./bin/echo-client",
-    "holon_rpc_server": "./bin/holon-rpc-server"
-  },
   "capabilities": {
-    "grpc_listen_tcp": true,
-    "grpc_listen_stdio": true,
-    "grpc_listen_unix": true,
-    "grpc_listen_mem": true,
-    "grpc_dial_tcp": true,
+    "bidirectional": true,
     "grpc_dial_stdio": true,
+    "grpc_dial_tcp": true,
     "grpc_dial_unix": true,
     "grpc_dial_ws": true,
+    "grpc_listen_mem": true,
+    "grpc_listen_stdio": true,
+    "grpc_listen_tcp": true,
+    "grpc_listen_unix": true,
+    "grpc_reject_oversize": true,
     "holon_rpc_client": true,
     "holon_rpc_server": true,
-    "bidirectional": true,
-    "valence": "multi",
     "routing": [
       "unicast"
-    ]
+    ],
+    "valence": "multi"
   },
+  "executables": {
+    "echo_client": "./bin/echo-client",
+    "echo_server": "./bin/echo-server",
+    "holon_rpc_server": "./bin/holon-rpc-server"
+  },
+  "lang": "cpp",
   "last_certified": {
-    "commit": "",
-    "date": "",
-    "level": 0
+    "commit": "e6a62935b2fac54902ad55bfc68d1e6dad5a657e",
+    "date": "2026-02-15",
+    "level": 4
   },
-  "role": "client"
+  "role": "client",
+  "sdk": "cpp-holons",
+  "version": "0.1.0"
 }
