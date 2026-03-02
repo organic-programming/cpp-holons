@@ -1,5 +1,164 @@
 #include "../include/holons/holons.hpp"
 
+#ifdef _WIN32
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <cassert>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace {
+
+int connect_tcp(const std::string &host, int port) {
+  SOCKET fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == INVALID_SOCKET) {
+    return -1;
+  }
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+    ::closesocket(fd);
+    return -1;
+  }
+
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    ::closesocket(fd);
+    return -1;
+  }
+
+  return static_cast<int>(fd);
+}
+
+} // namespace
+
+int main() {
+  int passed = 0;
+
+  assert(holons::scheme("tcp://:9090") == "tcp");
+  ++passed;
+  assert(holons::scheme("unix:///tmp/x.sock") == "unix");
+  ++passed;
+  assert(holons::scheme("stdio://") == "stdio");
+  ++passed;
+  assert(holons::scheme("mem://") == "mem");
+  ++passed;
+
+  auto parsed = holons::parse_uri("wss://example.com:8443");
+  assert(parsed.scheme == "wss");
+  ++passed;
+  assert(parsed.host == "example.com");
+  ++passed;
+  assert(parsed.port == 8443);
+  ++passed;
+  assert(parsed.path == "/grpc");
+  ++passed;
+  assert(parsed.secure);
+  ++passed;
+
+  auto tcp_lis = holons::listen("tcp://127.0.0.1:0");
+  auto *tcp = std::get_if<holons::tcp_listener>(&tcp_lis);
+  assert(tcp != nullptr);
+  ++passed;
+
+  sockaddr_in addr{};
+  int len = sizeof(addr);
+  int rc = ::getsockname(static_cast<SOCKET>(tcp->fd),
+                         reinterpret_cast<sockaddr *>(&addr), &len);
+  assert(rc == 0);
+  ++passed;
+
+  int port = ntohs(addr.sin_port);
+  assert(port > 0);
+  ++passed;
+
+  int cfd = connect_tcp("127.0.0.1", port);
+  assert(cfd >= 0);
+  ++passed;
+
+  auto server_conn = holons::accept(tcp_lis);
+  assert(server_conn.scheme == "tcp");
+  ++passed;
+
+  const char *ping = "ping";
+  int wrote = ::send(static_cast<SOCKET>(cfd), ping, 4, 0);
+  assert(wrote == 4);
+  ++passed;
+
+  char buf[8] = {0};
+  auto read_n = holons::conn_read(server_conn, buf, sizeof(buf));
+  assert(read_n == 4);
+  ++passed;
+  assert(std::string(buf, 4) == "ping");
+  ++passed;
+
+  holons::close_connection(server_conn);
+  ::closesocket(static_cast<SOCKET>(cfd));
+  holons::close_listener(tcp_lis);
+
+  auto stdio_lis = holons::listen("stdio://");
+  auto stdio_conn = holons::accept(stdio_lis);
+  assert(stdio_conn.scheme == "stdio");
+  ++passed;
+  holons::close_connection(stdio_conn);
+
+  auto mem_lis = holons::listen("mem://unit");
+  auto mem_client = holons::mem_dial(mem_lis);
+  auto mem_server = holons::accept(mem_lis);
+  const char *msg = "mem";
+  auto mem_wrote = holons::conn_write(mem_client, msg, 3);
+  assert(mem_wrote == 3);
+  ++passed;
+
+  char mem_buf[8] = {0};
+  auto mem_read = holons::conn_read(mem_server, mem_buf, sizeof(mem_buf));
+  assert(mem_read == 3);
+  ++passed;
+  assert(std::string(mem_buf, 3) == "mem");
+  ++passed;
+
+  holons::close_connection(mem_server);
+  holons::close_connection(mem_client);
+  holons::close_listener(mem_lis);
+
+  try {
+    (void)holons::listen("unix://C:/tmp/holons.sock");
+    assert(false && "unix:// should throw on Windows");
+  } catch (const std::runtime_error &) {
+    ++passed;
+  }
+
+  assert(holons::parse_flags({"--listen", "tcp://:8080"}) == "tcp://:8080");
+  ++passed;
+  assert(holons::parse_flags({"--port", "3000"}) == "tcp://:3000");
+  ++passed;
+  assert(holons::parse_flags({}) == "tcp://:9090");
+  ++passed;
+
+  auto temp_path = std::filesystem::temp_directory_path() /
+                   "holons_cpp_windows_test_holon.md";
+  {
+    std::ofstream f(temp_path);
+    f << "---\nuuid: \"abc-123\"\ngiven_name: \"test\"\n"
+      << "family_name: \"Test\"\nlang: \"cpp\"\n---\n# test\n";
+  }
+  auto id = holons::parse_holon(temp_path.string());
+  assert(id.uuid == "abc-123");
+  ++passed;
+  assert(id.given_name == "test");
+  ++passed;
+  std::filesystem::remove(temp_path);
+
+  std::printf("%d passed, 0 failed\n", passed);
+  return 0;
+}
+
+#else
+
 #include <arpa/inet.h>
 #include <cassert>
 #include <cerrno>
@@ -1290,3 +1449,5 @@ int main() {
   std::printf("%d passed, 0 failed\n", passed);
   return 0;
 }
+
+#endif

@@ -21,6 +21,20 @@ with native Holon-RPC client support.
 clang++ -std=c++20 -pthread -I include -I /opt/homebrew/include test/holons_test.cpp -o test_runner && ./test_runner
 ```
 
+POSIX shortcut:
+
+```bash
+make test
+```
+
+Windows (MSVC/MinGW) via CMake:
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/test_runner
+```
+
 ## API surface
 
 | Symbol | Description |
@@ -44,9 +58,9 @@ clang++ -std=c++20 -pthread -I include -I /opt/homebrew/include test/holons_test
 | Scheme | Support |
 |--------|---------|
 | `tcp://<host>:<port>` | Bound socket (`tcp_listener`) |
-| `unix://<path>` | Bound UNIX socket (`unix_listener`) |
+| `unix://<path>` | Bound UNIX socket (`unix_listener`) on POSIX; unsupported on Windows |
 | `stdio://` | Native runtime accept (single-connection semantics) |
-| `mem://` | Native in-process transport (`mem_dial` + `accept`) |
+| `mem://` | Native in-process transport (`mem_dial` + `accept`); Windows uses loopback socketpair emulation |
 | `ws://<host>:<port>` | Listener metadata (`ws_listener`) |
 | `wss://<host>:<port>` | Listener metadata (`ws_listener`) |
 

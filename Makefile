@@ -6,6 +6,11 @@ TEST_BIN := test_runner
 
 .PHONY: test clean
 
+# This Makefile targets POSIX toolchains. On Windows, use CMake/MSVC.
+ifeq ($(OS),Windows_NT)
+$(warning Use CMake (or MSVC directly) on Windows; this Makefile is POSIX-oriented.)
+endif
+
 test: $(TEST_BIN)
 	./$(TEST_BIN)
 

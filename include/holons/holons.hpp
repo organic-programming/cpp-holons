@@ -1,6 +1,5 @@
 #pragma once
 
-#include <arpa/inet.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,14 +7,45 @@
 #include <cmath>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#include <fcntl.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
+#if defined(_MSC_VER) && !defined(_SSIZE_T_DEFINED)
+using ssize_t = intptr_t;
+#define _SSIZE_T_DEFINED
+#endif
+
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#else
+#include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 #if __has_include(<nlohmann/json.hpp>)
 #include <nlohmann/json.hpp>
 #elif __has_include("/opt/homebrew/include/nlohmann/json.hpp")
@@ -31,15 +61,128 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <tuple>
 #include <unordered_map>
-#include <unistd.h>
 #include <variant>
 #include <vector>
 
 namespace holons {
+
+#ifdef _WIN32
+namespace detail {
+struct winsock_init {
+  winsock_init() {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+      throw std::runtime_error("WSAStartup failed");
+    }
+  }
+
+  ~winsock_init() { WSACleanup(); }
+};
+
+inline void ensure_winsock() {
+  static winsock_init instance;
+  (void)instance;
+}
+} // namespace detail
+#endif
+
+inline int close_fd(int fd, bool is_socket) {
+#ifdef _WIN32
+  return is_socket ? static_cast<int>(::closesocket(static_cast<SOCKET>(fd)))
+                   : ::_close(fd);
+#else
+  (void)is_socket;
+  return ::close(fd);
+#endif
+}
+
+inline int unlink_path(const char *path) {
+#ifdef _WIN32
+  return ::_unlink(path);
+#else
+  return ::unlink(path);
+#endif
+}
+
+inline int socket_shutdown_both() {
+#ifdef _WIN32
+  return SD_BOTH;
+#else
+  return SHUT_RDWR;
+#endif
+}
+
+inline std::string last_socket_error() {
+#ifdef _WIN32
+  return "winsock error " + std::to_string(WSAGetLastError());
+#else
+  return std::strerror(errno);
+#endif
+}
+
+#ifdef _WIN32
+inline int win_socketpair(int fds[2]) {
+  fds[0] = -1;
+  fds[1] = -1;
+
+  SOCKET listener = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listener == INVALID_SOCKET) {
+    return -1;
+  }
+
+  int one = 1;
+  ::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char *>(&one), sizeof(one));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
+      0) {
+    ::closesocket(listener);
+    return -1;
+  }
+
+  int addrlen = sizeof(addr);
+  if (::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &addrlen) !=
+      0) {
+    ::closesocket(listener);
+    return -1;
+  }
+
+  if (::listen(listener, 1) != 0) {
+    ::closesocket(listener);
+    return -1;
+  }
+
+  SOCKET client = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (client == INVALID_SOCKET) {
+    ::closesocket(listener);
+    return -1;
+  }
+
+  if (::connect(client, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
+      0) {
+    ::closesocket(client);
+    ::closesocket(listener);
+    return -1;
+  }
+
+  SOCKET server = ::accept(listener, nullptr, nullptr);
+  ::closesocket(listener);
+  if (server == INVALID_SOCKET) {
+    ::closesocket(client);
+    return -1;
+  }
+
+  fds[0] = static_cast<int>(server);
+  fds[1] = static_cast<int>(client);
+  return 0;
+}
+#endif
 
 /// Default transport URI when --listen is omitted.
 constexpr std::string_view kDefaultURI = "tcp://:9090";
@@ -182,6 +325,9 @@ inline parsed_uri parse_uri(const std::string &uri) {
 }
 
 inline listener listen(const std::string &uri) {
+#ifdef _WIN32
+  detail::ensure_winsock();
+#endif
   auto parsed = parse_uri(uri);
 
   if (parsed.scheme == "tcp") {
@@ -190,7 +336,12 @@ inline listener listen(const std::string &uri) {
       throw std::runtime_error("socket() failed");
 
     int one = 1;
+#ifdef _WIN32
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                 reinterpret_cast<const char *>(&one), sizeof(one));
+#else
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -198,47 +349,55 @@ inline listener listen(const std::string &uri) {
     if (parsed.host == "0.0.0.0") {
       addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (::inet_pton(AF_INET, parsed.host.c_str(), &addr.sin_addr) != 1) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error("invalid tcp host: " + parsed.host);
     }
 
     if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error("bind() failed");
     }
     if (::listen(fd, 16) < 0) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error("listen() failed");
     }
     return tcp_listener{fd, parsed.host, parsed.port};
   }
 
   if (parsed.scheme == "unix") {
+#ifdef _WIN32
+    throw std::runtime_error("unix:// not supported on Windows");
+#else
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
       throw std::runtime_error("socket() failed");
 
-    ::unlink(parsed.path.c_str());
+    unlink_path(parsed.path.c_str());
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", parsed.path.c_str());
 
     if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error("bind(unix) failed");
     }
     if (::listen(fd, 16) < 0) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error("listen(unix) failed");
     }
     return unix_listener{fd, parsed.path};
+#endif
   }
 
   if (parsed.scheme == "stdio")
     return stdio_listener{parsed.raw, false};
   if (parsed.scheme == "mem") {
     int fds[2] = {-1, -1};
+#ifdef _WIN32
+    if (win_socketpair(fds) != 0) {
+#else
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+#endif
       throw std::runtime_error("mem socketpair() failed");
     }
     return mem_listener{parsed.raw, fds[0], fds[1], false, false};
@@ -257,8 +416,7 @@ inline connection accept(listener &lis) {
   if (auto *tcp = std::get_if<tcp_listener>(&lis)) {
     int fd = ::accept(tcp->fd, nullptr, nullptr);
     if (fd < 0) {
-      throw std::runtime_error("accept(tcp) failed: " +
-                               std::string(std::strerror(errno)));
+      throw std::runtime_error("accept(tcp) failed: " + last_socket_error());
     }
     return connection{fd, fd, "tcp", true, true};
   }
@@ -266,8 +424,7 @@ inline connection accept(listener &lis) {
   if (auto *unix_lis = std::get_if<unix_listener>(&lis)) {
     int fd = ::accept(unix_lis->fd, nullptr, nullptr);
     if (fd < 0) {
-      throw std::runtime_error("accept(unix) failed: " +
-                               std::string(std::strerror(errno)));
+      throw std::runtime_error("accept(unix) failed: " + last_socket_error());
     }
     return connection{fd, fd, "unix", true, true};
   }
@@ -314,49 +471,77 @@ inline connection mem_dial(listener &lis) {
 }
 
 inline ssize_t conn_read(const connection &conn, void *buf, size_t n) {
-  return ::read(conn.read_fd, buf, n);
+  if (conn.scheme == "stdio") {
+#ifdef _WIN32
+    return ::_read(conn.read_fd, buf, static_cast<unsigned int>(n));
+#else
+    return ::read(conn.read_fd, buf, n);
+#endif
+  }
+#ifdef _WIN32
+  return ::recv(static_cast<SOCKET>(conn.read_fd), static_cast<char *>(buf),
+                static_cast<int>(n), 0);
+#else
+  return ::recv(conn.read_fd, static_cast<char *>(buf), n, 0);
+#endif
 }
 
 inline ssize_t conn_write(const connection &conn, const void *buf, size_t n) {
-  return ::write(conn.write_fd, buf, n);
+  if (conn.scheme == "stdio") {
+#ifdef _WIN32
+    return ::_write(conn.write_fd, buf, static_cast<unsigned int>(n));
+#else
+    return ::write(conn.write_fd, buf, n);
+#endif
+  }
+#ifdef _WIN32
+  return ::send(static_cast<SOCKET>(conn.write_fd),
+                static_cast<const char *>(buf), static_cast<int>(n), 0);
+#else
+  return ::send(conn.write_fd, static_cast<const char *>(buf), n, 0);
+#endif
 }
 
 inline void close_connection(connection &conn) {
-  if (conn.owns_read_fd && conn.read_fd >= 0) {
-    ::close(conn.read_fd);
-    conn.read_fd = -1;
+  const int read_fd = conn.read_fd;
+  const int write_fd = conn.write_fd;
+  const bool socket_fds = conn.scheme != "stdio";
+
+  if (conn.owns_read_fd && read_fd >= 0) {
+    close_fd(read_fd, socket_fds);
   }
-  if (conn.owns_write_fd && conn.write_fd >= 0 &&
-      conn.write_fd != conn.read_fd) {
-    ::close(conn.write_fd);
-    conn.write_fd = -1;
+  if (conn.owns_write_fd && write_fd >= 0 && write_fd != read_fd) {
+    close_fd(write_fd, socket_fds);
   }
+
+  conn.read_fd = -1;
+  conn.write_fd = -1;
 }
 
 inline void close_listener(listener &lis) {
   if (auto *tcp = std::get_if<tcp_listener>(&lis)) {
     if (tcp->fd >= 0) {
-      ::close(tcp->fd);
+      close_fd(tcp->fd, true);
       tcp->fd = -1;
     }
     return;
   }
   if (auto *unix_lis = std::get_if<unix_listener>(&lis)) {
     if (unix_lis->fd >= 0) {
-      ::close(unix_lis->fd);
+      close_fd(unix_lis->fd, true);
       unix_lis->fd = -1;
     }
     if (!unix_lis->path.empty())
-      ::unlink(unix_lis->path.c_str());
+      unlink_path(unix_lis->path.c_str());
     return;
   }
   if (auto *mem = std::get_if<mem_listener>(&lis)) {
     if (mem->server_fd >= 0) {
-      ::close(mem->server_fd);
+      close_fd(mem->server_fd, true);
       mem->server_fd = -1;
     }
     if (mem->client_fd >= 0) {
-      ::close(mem->client_fd);
+      close_fd(mem->client_fd, true);
       mem->client_fd = -1;
     }
   }
@@ -622,7 +807,7 @@ private:
   void close_socket() {
     std::lock_guard<std::mutex> lock(state_mu_);
     if (sockfd_ >= 0) {
-      ::close(sockfd_);
+      close_fd(sockfd_, true);
       sockfd_ = -1;
     }
   }
@@ -634,7 +819,7 @@ private:
       fd = sockfd_;
     }
     if (fd >= 0) {
-      ::shutdown(fd, SHUT_RDWR);
+      ::shutdown(fd, socket_shutdown_both());
     }
   }
 
@@ -653,7 +838,10 @@ private:
     const auto *ptr = static_cast<const uint8_t *>(data);
     size_t sent = 0;
     while (sent < size) {
-      ssize_t n = ::send(fd, ptr + sent, size - sent, 0);
+      size_t chunk = std::min(size - sent,
+                              static_cast<size_t>(std::numeric_limits<int>::max()));
+      ssize_t n = ::send(fd, reinterpret_cast<const char *>(ptr + sent),
+                         static_cast<int>(chunk), 0);
       if (n <= 0) {
         return false;
       }
@@ -666,7 +854,10 @@ private:
     auto *ptr = static_cast<uint8_t *>(data);
     size_t got = 0;
     while (got < size) {
-      ssize_t n = ::recv(fd, ptr + got, size - got, 0);
+      size_t chunk = std::min(size - got,
+                              static_cast<size_t>(std::numeric_limits<int>::max()));
+      ssize_t n = ::recv(fd, reinterpret_cast<char *>(ptr + got),
+                         static_cast<int>(chunk), 0);
       if (n <= 0) {
         return false;
       }
@@ -676,6 +867,9 @@ private:
   }
 
   bool open_socket() {
+#ifdef _WIN32
+    detail::ensure_winsock();
+#endif
     auto parsed = parse_uri(endpoint_);
     if (parsed.scheme != "ws" && parsed.scheme != "wss") {
       throw std::runtime_error("holon-rpc requires ws:// or wss:// endpoint");
@@ -694,12 +888,12 @@ private:
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(parsed.port));
     if (::inet_pton(AF_INET, parsed.host.c_str(), &addr.sin_addr) != 1) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error("invalid ws host: " + parsed.host);
     }
 
     if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-      ::close(fd);
+      close_fd(fd, true);
       return false;
     }
 
@@ -715,7 +909,7 @@ private:
 
     auto req_str = req.str();
     if (!send_all(fd, req_str.data(), req_str.size())) {
-      ::close(fd);
+      close_fd(fd, true);
       return false;
     }
 
@@ -725,12 +919,12 @@ private:
     while (headers.find("\r\n\r\n") == std::string::npos) {
       ssize_t n = ::recv(fd, &ch, 1, 0);
       if (n <= 0) {
-        ::close(fd);
+        close_fd(fd, true);
         return false;
       }
       headers.push_back(ch);
       if (headers.size() > 16384) {
-        ::close(fd);
+        close_fd(fd, true);
         throw std::runtime_error("websocket handshake too large");
       }
     }
@@ -742,7 +936,7 @@ private:
     if (lower.find(" 101 ") == std::string::npos ||
         lower.find("sec-websocket-protocol: holon-rpc") ==
             std::string::npos) {
-      ::close(fd);
+      close_fd(fd, true);
       throw std::runtime_error(
           "server did not negotiate holon-rpc websocket protocol");
     }
