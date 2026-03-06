@@ -49,7 +49,7 @@ cmake --build build
 | `holons::close_connection(conn)` | Close runtime connection FDs |
 | `holons::close_listener(listener)` | Close and cleanup listener resources |
 | `holons::parse_flags(args)` | CLI arg extraction |
-| `holons::parse_holon(path)` | HOLON.md YAML parser |
+| `holons::parse_holon(path)` | holon.yaml parser |
 | `holons::holon_rpc_client` | `connect(url)`, `invoke(method, params)`, `register_handler(method, fn)`, `close()` |
 | `holons::kDefaultURI` | Default transport URI |
 
