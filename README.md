@@ -1,15 +1,3 @@
----
-# Cartouche v1
-title: "cpp-holons — C++ SDK for Organic Programming"
-author:
-  name: "B. ALTER"
-created: 2026-02-12
-revised: 2026-02-13
-access:
-  humans: true
-  agents: false
-status: draft
----
 # cpp-holons
 
 **C++ SDK for Organic Programming** — header-only transport/identity core
