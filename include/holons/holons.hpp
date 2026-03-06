@@ -1301,7 +1301,7 @@ private:
   std::atomic<uint64_t> next_id_{0};
 };
 
-/// Parsed holon identity from HOLON.md.
+/// Parsed holon identity from a holon manifest.
 struct HolonIdentity {
   std::string uuid;
   std::string given_name;
@@ -1332,7 +1332,7 @@ inline std::string yaml_value(const std::string &line) {
   return val;
 }
 
-/// Parse a HOLON.md file (simplified — no YAML library dependency).
+/// Parse a HOLON.md frontmatter block or a holon.yaml file.
 inline HolonIdentity parse_holon(const std::string &path) {
   std::ifstream file(path);
   if (!file.is_open())
@@ -1341,18 +1341,24 @@ inline HolonIdentity parse_holon(const std::string &path) {
   std::string text((std::istreambuf_iterator<char>(file)),
                    std::istreambuf_iterator<char>());
 
-  if (text.substr(0, 3) != "---")
+  std::string manifest;
+  if (text.rfind("---", 0) == 0) {
+    auto end_pos = text.find("---", 3);
+    if (end_pos == std::string::npos)
+      throw std::runtime_error(path + ": unterminated frontmatter");
+    manifest = text.substr(3, end_pos - 3);
+  } else if (path.size() >= 5 &&
+             (path.substr(path.size() - 5) == ".yaml" ||
+              path.substr(path.size() - 4) == ".yml")) {
+    manifest = text;
+  } else {
     throw std::runtime_error(path + ": missing YAML frontmatter");
+  }
 
-  auto end_pos = text.find("---", 3);
-  if (end_pos == std::string::npos)
-    throw std::runtime_error(path + ": unterminated frontmatter");
-
-  auto frontmatter = text.substr(3, end_pos - 3);
   HolonIdentity id;
 
   // Simple line-by-line parsing
-  std::istringstream ss(frontmatter);
+  std::istringstream ss(manifest);
   std::string line;
   while (std::getline(ss, line)) {
     if (line.find("uuid:") == 0)
