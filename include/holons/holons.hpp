@@ -9,8 +9,10 @@
 #include <chrono>
 #include <cstdint>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -62,6 +64,7 @@ using ssize_t = intptr_t;
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <optional>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -1314,22 +1317,158 @@ struct HolonIdentity {
   std::string lang;
 };
 
+struct HolonBuild {
+  std::string runner;
+  std::string main;
+};
+
+struct HolonArtifacts {
+  std::string binary;
+  std::string primary;
+};
+
+struct HolonManifest {
+  std::string kind;
+  HolonBuild build;
+  HolonArtifacts artifacts;
+};
+
+struct HolonEntry {
+  std::string slug;
+  std::string uuid;
+  std::filesystem::path dir;
+  std::filesystem::path relative_path;
+  std::string origin;
+  HolonIdentity identity;
+  std::optional<HolonManifest> manifest;
+};
+
+inline std::string trim_copy(std::string value) {
+  auto start = value.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) {
+    return "";
+  }
+  auto end = value.find_last_not_of(" \t\r\n");
+  return value.substr(start, end - start + 1);
+}
+
+inline std::string strip_quotes(std::string value) {
+  if (value.size() >= 2 &&
+      ((value.front() == '"' && value.back() == '"') ||
+       (value.front() == '\'' && value.back() == '\''))) {
+    return value.substr(1, value.size() - 2);
+  }
+  return value;
+}
+
 /// Extract a YAML value from a simple key: "value" line.
 /// Handles both quoted and unquoted values.
 inline std::string yaml_value(const std::string &line) {
   auto colon = line.find(':');
   if (colon == std::string::npos)
     return "";
-  auto val = line.substr(colon + 1);
-  // Trim leading whitespace
-  auto start = val.find_first_not_of(" \t");
-  if (start == std::string::npos)
-    return "";
-  val = val.substr(start);
-  // Strip quotes
-  if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
-    val = val.substr(1, val.size() - 2);
-  return val;
+  return strip_quotes(trim_copy(line.substr(colon + 1)));
+}
+
+inline std::string slug_from_identity(const HolonIdentity &id) {
+  auto append_part = [](std::string *out, const std::string &value) {
+    auto trimmed = trim_copy(value);
+    for (char ch : trimmed) {
+      if (ch == '?') {
+        continue;
+      }
+      if (std::isspace(static_cast<unsigned char>(ch))) {
+        out->push_back('-');
+      } else {
+        out->push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+      }
+    }
+    while (!out->empty() && out->back() == '-') {
+      out->pop_back();
+    }
+  };
+
+  std::string slug;
+  append_part(&slug, id.given_name);
+  if (!slug.empty() && (!id.family_name.empty())) {
+    slug.push_back('-');
+  }
+  append_part(&slug, id.family_name);
+  while (!slug.empty() && slug.back() == '-') {
+    slug.pop_back();
+  }
+  return slug;
+}
+
+inline std::optional<HolonManifest> parse_manifest(const std::string &path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    throw std::runtime_error("cannot open: " + path);
+  }
+
+  HolonManifest manifest;
+  bool saw_mapping = false;
+  bool saw_manifest_value = false;
+  std::string section;
+  std::string line;
+
+  while (std::getline(file, line)) {
+    auto indent = line.find_first_not_of(" \t");
+    if (indent == std::string::npos) {
+      continue;
+    }
+
+    std::string trimmed = trim_copy(line);
+    if (trimmed.empty() || trimmed.front() == '#') {
+      continue;
+    }
+
+    auto colon = trimmed.find(':');
+    if (colon == std::string::npos) {
+      continue;
+    }
+
+    saw_mapping = true;
+    std::string key = trimmed.substr(0, colon);
+    std::string value = yaml_value(trimmed);
+
+    if (indent == 0) {
+      section.clear();
+      if (key == "kind") {
+        manifest.kind = value;
+        saw_manifest_value = true;
+      } else if ((key == "build" || key == "artifacts") && value.empty()) {
+        section = key;
+      }
+      continue;
+    }
+
+    if (section == "build") {
+      if (key == "runner") {
+        manifest.build.runner = value;
+        saw_manifest_value = true;
+      } else if (key == "main") {
+        manifest.build.main = value;
+        saw_manifest_value = true;
+      }
+    } else if (section == "artifacts") {
+      if (key == "binary") {
+        manifest.artifacts.binary = value;
+        saw_manifest_value = true;
+      } else if (key == "primary") {
+        manifest.artifacts.primary = value;
+        saw_manifest_value = true;
+      }
+    }
+  }
+
+  if (!saw_mapping) {
+    throw std::runtime_error(path + ": holon.yaml must be a YAML mapping");
+  }
+  if (!saw_manifest_value) {
+    return std::nullopt;
+  }
+  return manifest;
 }
 
 /// Parse a holon.yaml file.
@@ -1348,30 +1487,226 @@ inline HolonIdentity parse_holon(const std::string &path) {
   std::istringstream ss(text);
   std::string line;
   while (std::getline(ss, line)) {
-    if (line.find(':') != std::string::npos)
+    std::string trimmed = trim_copy(line);
+    if (trimmed.empty() || trimmed.front() == '#') {
+      continue;
+    }
+    if (trimmed.find(':') != std::string::npos)
       saw_mapping = true;
-    if (line.find("uuid:") == 0)
-      id.uuid = yaml_value(line);
-    else if (line.find("given_name:") == 0)
-      id.given_name = yaml_value(line);
-    else if (line.find("family_name:") == 0)
-      id.family_name = yaml_value(line);
-    else if (line.find("motto:") == 0)
-      id.motto = yaml_value(line);
-    else if (line.find("composer:") == 0)
-      id.composer = yaml_value(line);
-    else if (line.find("clade:") == 0)
-      id.clade = yaml_value(line);
-    else if (line.find("status:") == 0)
-      id.status = yaml_value(line);
-    else if (line.find("born:") == 0)
-      id.born = yaml_value(line);
-    else if (line.find("lang:") == 0)
-      id.lang = yaml_value(line);
+    if (trimmed.find("uuid:") == 0)
+      id.uuid = yaml_value(trimmed);
+    else if (trimmed.find("given_name:") == 0)
+      id.given_name = yaml_value(trimmed);
+    else if (trimmed.find("family_name:") == 0)
+      id.family_name = yaml_value(trimmed);
+    else if (trimmed.find("motto:") == 0)
+      id.motto = yaml_value(trimmed);
+    else if (trimmed.find("composer:") == 0)
+      id.composer = yaml_value(trimmed);
+    else if (trimmed.find("clade:") == 0)
+      id.clade = yaml_value(trimmed);
+    else if (trimmed.find("status:") == 0)
+      id.status = yaml_value(trimmed);
+    else if (trimmed.find("born:") == 0)
+      id.born = yaml_value(trimmed);
+    else if (trimmed.find("lang:") == 0)
+      id.lang = yaml_value(trimmed);
   }
   if (!saw_mapping)
     throw std::runtime_error(path + ": holon.yaml must be a YAML mapping");
   return id;
+}
+
+inline std::filesystem::path discover_resolve_root(const std::filesystem::path &root) {
+  std::error_code ec;
+  auto absolute = std::filesystem::absolute(root, ec);
+  if (ec) {
+    absolute = root;
+    ec.clear();
+  }
+  auto canonical = std::filesystem::weakly_canonical(absolute, ec);
+  return ec ? absolute : canonical;
+}
+
+inline bool should_skip_discovery_dir(const std::string &name) {
+  return name == ".git" || name == ".op" || name == "node_modules" ||
+         name == "vendor" || name == "build" ||
+         (!name.empty() && name.front() == '.');
+}
+
+inline size_t discovery_depth(const std::filesystem::path &path) {
+  if (path.empty() || path == ".") {
+    return 0;
+  }
+  return static_cast<size_t>(std::distance(path.begin(), path.end()));
+}
+
+inline void append_or_replace_entry(
+    std::vector<HolonEntry> &entries,
+    std::unordered_map<std::string, size_t> &index_by_key,
+    const HolonEntry &candidate) {
+  auto key = candidate.uuid.empty() ? candidate.dir.generic_string() : candidate.uuid;
+  auto existing = index_by_key.find(key);
+  if (existing != index_by_key.end()) {
+    auto &current = entries[existing->second];
+    if (discovery_depth(candidate.relative_path) <
+        discovery_depth(current.relative_path)) {
+      current = candidate;
+    }
+    return;
+  }
+
+  index_by_key.emplace(key, entries.size());
+  entries.push_back(candidate);
+}
+
+inline HolonEntry parse_holon_entry(const std::filesystem::path &manifest_path,
+                                    const std::filesystem::path &root,
+                                    const std::string &origin) {
+  HolonEntry entry;
+  entry.identity = parse_holon(manifest_path.string());
+  entry.slug = slug_from_identity(entry.identity);
+  entry.uuid = entry.identity.uuid;
+  entry.dir = discover_resolve_root(manifest_path.parent_path());
+  entry.relative_path = entry.dir.lexically_relative(root);
+  if (entry.relative_path.empty()) {
+    entry.relative_path = ".";
+  }
+  entry.origin = origin;
+  entry.manifest = parse_manifest(manifest_path.string());
+  return entry;
+}
+
+inline std::vector<HolonEntry> discover_with_origin(
+    const std::filesystem::path &root, const std::string &origin) {
+  std::error_code ec;
+  auto resolved_root = discover_resolve_root(root);
+  if (!std::filesystem::exists(resolved_root, ec) ||
+      !std::filesystem::is_directory(resolved_root, ec)) {
+    return {};
+  }
+
+  std::vector<HolonEntry> entries;
+  std::unordered_map<std::string, size_t> index_by_key;
+  std::filesystem::recursive_directory_iterator it(
+      resolved_root, std::filesystem::directory_options::skip_permission_denied, ec);
+  std::filesystem::recursive_directory_iterator end;
+
+  for (; it != end; it.increment(ec)) {
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+
+    const auto &path = it->path();
+    if (it->is_directory(ec)) {
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      if (should_skip_discovery_dir(path.filename().string())) {
+        it.disable_recursion_pending();
+      }
+      continue;
+    }
+
+    if (ec || !it->is_regular_file(ec) || path.filename() != "holon.yaml") {
+      ec.clear();
+      continue;
+    }
+
+    try {
+      append_or_replace_entry(entries, index_by_key,
+                              parse_holon_entry(path, resolved_root, origin));
+    } catch (const std::exception &) {
+      continue;
+    }
+  }
+
+  std::sort(entries.begin(), entries.end(),
+            [](const HolonEntry &left, const HolonEntry &right) {
+              auto left_rel = left.relative_path.generic_string();
+              auto right_rel = right.relative_path.generic_string();
+              if (left_rel != right_rel) {
+                return left_rel < right_rel;
+              }
+              return left.uuid < right.uuid;
+            });
+  return entries;
+}
+
+inline std::filesystem::path oppath() {
+  if (const char *configured = std::getenv("OPPATH");
+      configured != nullptr && *configured != '\0') {
+    return std::filesystem::path(configured);
+  }
+  if (const char *home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+    return std::filesystem::path(home) / ".op";
+  }
+  return ".op";
+}
+
+inline std::filesystem::path opbin() {
+  if (const char *configured = std::getenv("OPBIN");
+      configured != nullptr && *configured != '\0') {
+    return std::filesystem::path(configured);
+  }
+  return oppath() / "bin";
+}
+
+inline std::filesystem::path cache_dir() { return oppath() / "cache"; }
+
+inline std::vector<HolonEntry> discover(const std::filesystem::path &root) {
+  return discover_with_origin(root, "local");
+}
+
+inline std::vector<HolonEntry> discover_local() {
+  return discover(std::filesystem::current_path());
+}
+
+inline std::vector<HolonEntry> discover_all() {
+  std::vector<HolonEntry> merged;
+  std::unordered_map<std::string, size_t> index_by_key;
+
+  for (const auto &[root, origin] :
+       std::vector<std::pair<std::filesystem::path, std::string>>{
+           {std::filesystem::current_path(), "local"},
+           {opbin(), "$OPBIN"},
+           {cache_dir(), "cache"},
+       }) {
+    for (const auto &entry : discover_with_origin(root, origin)) {
+      append_or_replace_entry(merged, index_by_key, entry);
+    }
+  }
+
+  std::sort(merged.begin(), merged.end(),
+            [](const HolonEntry &left, const HolonEntry &right) {
+              auto left_rel = left.relative_path.generic_string();
+              auto right_rel = right.relative_path.generic_string();
+              if (left_rel != right_rel) {
+                return left_rel < right_rel;
+              }
+              return left.uuid < right.uuid;
+            });
+  return merged;
+}
+
+inline std::optional<HolonEntry> find_by_slug(const std::string &slug) {
+  for (const auto &entry : discover_all()) {
+    if (entry.slug == slug) {
+      return entry;
+    }
+  }
+  return std::nullopt;
+}
+
+inline std::optional<HolonEntry> find_by_uuid(const std::string &prefix) {
+  for (const auto &entry : discover_all()) {
+    if (entry.uuid.rfind(prefix, 0) == 0) {
+      return entry;
+    }
+  }
+  return std::nullopt;
 }
 
 } // namespace holons

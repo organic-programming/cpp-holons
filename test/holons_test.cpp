@@ -1,5 +1,63 @@
 #include "../include/holons/holons.hpp"
 
+namespace {
+
+std::filesystem::path make_temp_dir(const std::string &prefix) {
+  auto stamp = std::to_string(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  auto path = std::filesystem::temp_directory_path() / (prefix + stamp);
+  std::filesystem::create_directories(path);
+  return path;
+}
+
+void write_discovery_holon(const std::filesystem::path &dir,
+                           const std::string &uuid,
+                           const std::string &given_name,
+                           const std::string &family_name,
+                           const std::string &binary) {
+  std::filesystem::create_directories(dir);
+  std::ofstream out(dir / "holon.yaml");
+  out << "schema: holon/v0\n"
+      << "uuid: \"" << uuid << "\"\n"
+      << "given_name: \"" << given_name << "\"\n"
+      << "family_name: \"" << family_name << "\"\n"
+      << "motto: \"Test\"\n"
+      << "composer: \"test\"\n"
+      << "clade: deterministic/pure\n"
+      << "status: draft\n"
+      << "born: \"2026-03-07\"\n"
+      << "kind: native\n"
+      << "build:\n"
+      << "  runner: go-module\n"
+      << "artifacts:\n"
+      << "  binary: " << binary << "\n";
+}
+
+std::optional<std::string> capture_env(const char *name) {
+  if (const char *value = std::getenv(name); value != nullptr) {
+    return std::string(value);
+  }
+  return std::nullopt;
+}
+
+void restore_env(const char *name, const std::optional<std::string> &value) {
+#ifdef _WIN32
+  if (value.has_value()) {
+    _putenv_s(name, value->c_str());
+  } else {
+    _putenv_s(name, "");
+  }
+#else
+  if (value.has_value()) {
+    ::setenv(name, value->c_str(), 1);
+  } else {
+    ::unsetenv(name);
+  }
+#endif
+}
+
+} // namespace
+
 #ifdef _WIN32
 
 #include <winsock2.h>
@@ -152,6 +210,29 @@ int main() {
   assert(id.given_name == "test");
   ++passed;
   std::filesystem::remove(temp_path);
+
+  auto discover_root = make_temp_dir("holons_cpp_windows_discover_");
+  write_discovery_holon(discover_root / "holons" / "alpha", "uuid-alpha", "Alpha",
+                        "Go", "alpha-go");
+  write_discovery_holon(discover_root / "nested" / "beta", "uuid-beta", "Beta",
+                        "Rust", "beta-rust");
+  write_discovery_holon(discover_root / "nested" / "dup" / "alpha", "uuid-alpha",
+                        "Alpha", "Go", "alpha-go");
+  write_discovery_holon(discover_root / ".git" / "hidden", "uuid-hidden", "Hidden",
+                        "Holon", "hidden");
+
+  auto discovered = holons::discover(discover_root);
+  assert(discovered.size() == 2);
+  ++passed;
+  assert(discovered[0].slug == "alpha-go");
+  ++passed;
+  assert(discovered[0].relative_path.generic_string() == "holons/alpha");
+  ++passed;
+  assert(discovered[0].manifest.has_value());
+  ++passed;
+  assert(discovered[1].slug == "beta-rust");
+  ++passed;
+  std::filesystem::remove_all(discover_root);
 
   std::printf("%d passed, 0 failed\n", passed);
   return 0;
@@ -1334,6 +1415,70 @@ int main() {
       ++passed;
     }
     std::remove(path.c_str());
+  }
+
+  // --- discover ---
+  {
+    auto root = make_temp_dir("holons_cpp_discover_");
+    auto op_root = make_temp_dir("holons_cpp_op_");
+    auto previous_cwd = std::filesystem::current_path();
+    auto previous_oppath = capture_env("OPPATH");
+    auto previous_opbin = capture_env("OPBIN");
+
+    write_discovery_holon(root / "holons" / "alpha", "uuid-alpha", "Alpha", "Go",
+                          "alpha-go");
+    write_discovery_holon(root / "nested" / "beta", "uuid-beta", "Beta", "Rust",
+                          "beta-rust");
+    write_discovery_holon(root / "nested" / "dup" / "alpha", "uuid-alpha", "Alpha",
+                          "Go", "alpha-go");
+    write_discovery_holon(root / ".git" / "hidden", "uuid-hidden", "Ignored",
+                          "Holon", "ignored");
+    write_discovery_holon(root / "node_modules" / "x", "uuid-node", "Ignored",
+                          "Node", "ignored");
+    write_discovery_holon(op_root / "bin" / "gamma", "uuid-gamma", "Gamma", "Bin",
+                          "gamma-bin");
+    write_discovery_holon(op_root / "cache" / "delta", "uuid-delta", "Delta",
+                          "Cache", "delta-cache");
+
+    auto discovered = holons::discover(root);
+    assert(discovered.size() == 2);
+    ++passed;
+    assert(discovered[0].slug == "alpha-go");
+    ++passed;
+    assert(discovered[0].relative_path.generic_string() == "holons/alpha");
+    ++passed;
+    assert(discovered[0].manifest.has_value());
+    ++passed;
+    assert(discovered[0].manifest->build.runner == "go-module");
+    ++passed;
+    assert(discovered[1].slug == "beta-rust");
+    ++passed;
+
+    std::filesystem::current_path(root);
+    restore_env("OPPATH", std::optional<std::string>(op_root.string()));
+    restore_env("OPBIN", std::nullopt);
+
+    auto discovered_all = holons::discover_all();
+    assert(discovered_all.size() == 4);
+    ++passed;
+
+    auto by_slug = holons::find_by_slug("alpha-go");
+    assert(by_slug.has_value());
+    ++passed;
+    assert(by_slug->uuid == "uuid-alpha");
+    ++passed;
+
+    auto by_uuid = holons::find_by_uuid("uuid-d");
+    assert(by_uuid.has_value());
+    ++passed;
+    assert(by_uuid->origin == "cache");
+    ++passed;
+
+    std::filesystem::current_path(previous_cwd);
+    restore_env("OPPATH", previous_oppath);
+    restore_env("OPBIN", previous_opbin);
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(op_root);
   }
 
   // --- holon-rpc server interop (cpp wrapper) ---
