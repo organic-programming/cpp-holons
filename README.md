@@ -1,7 +1,7 @@
 # cpp-holons
 
-**C++ SDK for Organic Programming** — header-only transport/identity core
-with native Holon-RPC client support.
+**C++ SDK for Organic Programming** — header-only transport,
+identity, discovery, and Holon-RPC client utilities.
 
 ## Build & Test
 
@@ -15,60 +15,32 @@ POSIX shortcut:
 make test
 ```
 
-Windows (MSVC/MinGW) via CMake:
-
-```bash
-cmake -S . -B build
-cmake --build build
-./build/test_runner
-```
-
 ## API surface
 
 | Symbol | Description |
 |--------|-------------|
 | `holons::scheme(uri)` | Extract transport scheme |
 | `holons::parse_uri(uri)` | Parse transport URI into normalized fields |
-| `holons::listen(uri)` | Create listener variant (`tcp_listener`, `unix_listener`, `stdio_listener`, `mem_listener`, `ws_listener`) |
-| `holons::accept(listener)` | Accept one runtime connection (`tcp`, `unix`, `stdio`, `mem`) |
-| `holons::mem_dial(listener)` | Dial client-side `mem://` connection |
-| `holons::conn_read(conn, buf, n)` | Read bytes from a runtime connection |
-| `holons::conn_write(conn, buf, n)` | Write bytes to a runtime connection |
-| `holons::close_connection(conn)` | Close runtime connection FDs |
-| `holons::close_listener(listener)` | Close and cleanup listener resources |
+| `holons::listen(uri)` | Create a listener variant |
+| `holons::accept(listener)` | Accept one runtime connection |
+| `holons::mem_dial(listener)` | Dial the client side of a `mem://` listener |
 | `holons::parse_flags(args)` | CLI arg extraction |
-| `holons::parse_holon(path)` | holon.yaml parser |
-| `holons::holon_rpc_client` | `connect(url)`, `invoke(method, params)`, `register_handler(method, fn)`, `close()` |
-| `holons::kDefaultURI` | Default transport URI |
+| `holons::parse_holon(path)` | `holon.yaml` parser |
+| `holons::discover(root)` | Discover holons under a root |
+| `holons::discover_local()` | Discover from the current working directory |
+| `holons::discover_all()` | Discover from local, `$OPBIN`, and cache roots |
+| `holons::find_by_slug(slug)` | Resolve a holon by slug |
+| `holons::find_by_uuid(prefix)` | Resolve a holon by UUID prefix |
+| `holons::holon_rpc_client` | Holon-RPC client |
 
-## Transport support
+## Current scope
 
-| Scheme | Support |
-|--------|---------|
-| `tcp://<host>:<port>` | Bound socket (`tcp_listener`) |
-| `unix://<path>` | Bound UNIX socket (`unix_listener`) on POSIX; unsupported on Windows |
-| `stdio://` | Native runtime accept (single-connection semantics) |
-| `mem://` | Native in-process transport (`mem_dial` + `accept`); Windows uses loopback socketpair emulation |
-| `ws://<host>:<port>` | Listener metadata (`ws_listener`) |
-| `wss://<host>:<port>` | Listener metadata (`ws_listener`) |
+- Runtime transports: `tcp://`, `unix://`, `stdio://`, `mem://`
+- `ws://` and `wss://` are metadata-only at the transport layer
+- Discovery scans local, `$OPBIN`, and cache roots
 
-## Parity Notes vs Go Reference
+## Current gaps vs Go
 
-Implemented parity:
-
-- URI parsing and listener dispatch semantics
-- Runtime accept path for `tcp`, `unix`, `stdio`, and `mem`
-- In-process memory transport with explicit client/server ends (`mem_dial` + `accept`)
-- Holon-RPC client protocol support over `ws://` (JSON-RPC 2.0, heartbeat, reconnect, server-initiated calls)
-- Standard serve flag parsing
-- HOLON identity parsing
-
-Not yet achievable in this header-only runtime (justified gaps):
-
-- `wss://` Holon-RPC client support:
-  - Requires TLS/WebSocket client dependencies (for example OpenSSL + Beast), intentionally excluded from this minimal header-only SDK.
-- `ws://` / `wss://` runtime listener parity:
-  - This SDK currently exposes ws/wss as metadata only.
-  - A full Go-style WebSocket listener for gRPC would require additional HTTP/WebSocket runtime dependencies, which are intentionally excluded to keep this SDK zero-dependency.
-- Full gRPC transport parity (`Dial("tcp://...")`, `Dial("stdio://...")`, `Listen("stdio://...")`, and `Serve.Run()` wiring):
-  - Not present yet; requires a dedicated C++ gRPC integration layer beyond this header-only core.
+- No generic slug-based `connect()` helper yet.
+- No full gRPC `serve` lifecycle helper yet.
+- No Holon-RPC server module yet.
