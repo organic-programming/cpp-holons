@@ -1332,7 +1332,7 @@ inline std::string yaml_value(const std::string &line) {
   return val;
 }
 
-/// Parse a HOLON.md frontmatter block or a holon.yaml file.
+/// Parse a holon.yaml file.
 inline HolonIdentity parse_holon(const std::string &path) {
   std::ifstream file(path);
   if (!file.is_open())
@@ -1341,26 +1341,15 @@ inline HolonIdentity parse_holon(const std::string &path) {
   std::string text((std::istreambuf_iterator<char>(file)),
                    std::istreambuf_iterator<char>());
 
-  std::string manifest;
-  if (text.rfind("---", 0) == 0) {
-    auto end_pos = text.find("---", 3);
-    if (end_pos == std::string::npos)
-      throw std::runtime_error(path + ": unterminated frontmatter");
-    manifest = text.substr(3, end_pos - 3);
-  } else if (path.size() >= 5 &&
-             (path.substr(path.size() - 5) == ".yaml" ||
-              path.substr(path.size() - 4) == ".yml")) {
-    manifest = text;
-  } else {
-    throw std::runtime_error(path + ": missing YAML frontmatter");
-  }
-
   HolonIdentity id;
+  bool saw_mapping = false;
 
   // Simple line-by-line parsing
-  std::istringstream ss(manifest);
+  std::istringstream ss(text);
   std::string line;
   while (std::getline(ss, line)) {
+    if (line.find(':') != std::string::npos)
+      saw_mapping = true;
     if (line.find("uuid:") == 0)
       id.uuid = yaml_value(line);
     else if (line.find("given_name:") == 0)
@@ -1380,6 +1369,8 @@ inline HolonIdentity parse_holon(const std::string &path) {
     else if (line.find("lang:") == 0)
       id.lang = yaml_value(line);
   }
+  if (!saw_mapping)
+    throw std::runtime_error(path + ": holon.yaml must be a YAML mapping");
   return id;
 }
 

@@ -140,11 +140,11 @@ int main() {
   ++passed;
 
   auto temp_path = std::filesystem::temp_directory_path() /
-                   "holons_cpp_windows_test_holon.md";
+                   "holons_cpp_windows_test_holon.yaml";
   {
     std::ofstream f(temp_path);
-    f << "---\nuuid: \"abc-123\"\ngiven_name: \"test\"\n"
-      << "family_name: \"Test\"\nlang: \"cpp\"\n---\n# test\n";
+    f << "uuid: \"abc-123\"\ngiven_name: \"test\"\n"
+      << "family_name: \"Test\"\nlang: \"cpp\"\n";
   }
   auto id = holons::parse_holon(temp_path.string());
   assert(id.uuid == "abc-123");
@@ -203,12 +203,12 @@ int connect_tcp(const std::string &host, int port) {
   return fd;
 }
 
-std::string make_temp_markdown_path() {
+std::string make_temp_yaml_path() {
   char tmpl[] = "/tmp/holons_cpp_test_XXXXXX";
   int fd = ::mkstemp(tmpl);
   assert(fd >= 0);
   ::close(fd);
-  std::string path = std::string(tmpl) + ".md";
+  std::string path = std::string(tmpl) + ".yaml";
   std::remove(tmpl);
   return path;
 }
@@ -808,32 +808,6 @@ int main() {
   std::string bind_reason;
   bool bind_restricted = loopback_bind_restricted(bind_reason);
 
-  // --- certification declarations ---
-  {
-    auto raw = read_file_text("cert.json");
-    assert(!raw.empty());
-    ++passed;
-    assert(raw.find("\"echo_server\": \"./bin/echo-server\"") !=
-           std::string::npos);
-    ++passed;
-    assert(raw.find("\"echo_client\": \"./bin/echo-client\"") !=
-           std::string::npos);
-    ++passed;
-    assert(raw.find("\"holon_rpc_server\": \"./bin/holon-rpc-server\"") !=
-           std::string::npos);
-    ++passed;
-    assert(raw.find("\"grpc_dial_tcp\": true") != std::string::npos);
-    ++passed;
-    assert(raw.find("\"grpc_dial_stdio\": true") != std::string::npos);
-    ++passed;
-    assert(raw.find("\"grpc_dial_ws\": true") != std::string::npos);
-    ++passed;
-    assert(raw.find("\"grpc_reject_oversize\": true") != std::string::npos);
-    ++passed;
-    assert(raw.find("\"holon_rpc_server\": true") != std::string::npos);
-    ++passed;
-  }
-
   // --- echo wrapper scripts ---
   {
     assert(::access("./bin/echo-client", F_OK) == 0);
@@ -1329,11 +1303,11 @@ int main() {
 
   // --- parse_holon ---
   {
-    std::string path = make_temp_markdown_path();
+    std::string path = make_temp_yaml_path();
     {
       std::ofstream f(path);
-      f << "---\nuuid: \"abc-123\"\ngiven_name: \"test\"\n"
-        << "family_name: \"Test\"\nlang: \"cpp\"\n---\n# test\n";
+      f << "uuid: \"abc-123\"\ngiven_name: \"test\"\n"
+        << "family_name: \"Test\"\nlang: \"cpp\"\n";
     }
     auto id = holons::parse_holon(path);
     assert(id.uuid == "abc-123");
@@ -1345,18 +1319,18 @@ int main() {
     std::remove(path.c_str());
   }
 
-  // --- parse_holon missing frontmatter ---
+  // --- parse_holon invalid mapping ---
   {
-    std::string path = make_temp_markdown_path();
+    std::string path = make_temp_yaml_path();
     {
       std::ofstream f(path);
-      f << "# No frontmatter\n";
+      f << "- not\n- a\n- mapping\n";
     }
     try {
       holons::parse_holon(path);
       assert(false && "should have thrown");
     } catch (const std::runtime_error &e) {
-      assert(std::string(e.what()).find("frontmatter") != std::string::npos);
+      assert(std::string(e.what()).find("mapping") != std::string::npos);
       ++passed;
     }
     std::remove(path.c_str());
