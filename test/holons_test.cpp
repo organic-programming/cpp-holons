@@ -478,6 +478,249 @@ int run_bash_script(const std::string &script_body) {
   return rc;
 }
 
+struct cwd_guard {
+  std::filesystem::path previous;
+
+  explicit cwd_guard(const std::filesystem::path &next)
+      : previous(std::filesystem::current_path()) {
+    std::filesystem::current_path(next);
+  }
+
+  ~cwd_guard() { std::filesystem::current_path(previous); }
+};
+
+struct env_guard {
+  std::string name;
+  std::optional<std::string> previous;
+
+  env_guard(const char *env_name, const std::string &value)
+      : name(env_name), previous(capture_env(env_name)) {
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    ::setenv(name.c_str(), value.c_str(), 1);
+#endif
+  }
+
+  ~env_guard() { restore_env(name.c_str(), previous); }
+};
+
+struct child_process {
+  pid_t pid = -1;
+  int stdout_fd = -1;
+  int stderr_fd = -1;
+
+  ~child_process() {
+    if (pid > 0) {
+      ::kill(pid, SIGTERM);
+      int status = 0;
+      for (int i = 0; i < 80; ++i) {
+        auto rc = ::waitpid(pid, &status, WNOHANG);
+        if (rc == pid || rc < 0) {
+          pid = -1;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      }
+      if (pid > 0) {
+        ::kill(pid, SIGKILL);
+        (void)::waitpid(pid, &status, 0);
+        pid = -1;
+      }
+    }
+
+    if (stdout_fd >= 0) {
+      ::close(stdout_fd);
+      stdout_fd = -1;
+    }
+    if (stderr_fd >= 0) {
+      ::close(stderr_fd);
+      stderr_fd = -1;
+    }
+  }
+};
+
+child_process start_child_process(const std::string &binary,
+                                  const std::vector<std::string> &args,
+                                  const std::filesystem::path &cwd = {}) {
+  int stdout_pipe[2] = {-1, -1};
+  int stderr_pipe[2] = {-1, -1};
+  assert(::pipe(stdout_pipe) == 0);
+  assert(::pipe(stderr_pipe) == 0);
+
+  auto pid = ::fork();
+  assert(pid >= 0);
+
+  if (pid == 0) {
+    ::dup2(stdout_pipe[1], STDOUT_FILENO);
+    ::dup2(stderr_pipe[1], STDERR_FILENO);
+    ::close(stdout_pipe[0]);
+    ::close(stdout_pipe[1]);
+    ::close(stderr_pipe[0]);
+    ::close(stderr_pipe[1]);
+
+    if (!cwd.empty()) {
+      ::chdir(cwd.c_str());
+    }
+
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char *>(binary.c_str()));
+    for (const auto &arg : args) {
+      argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+    ::execv(binary.c_str(), argv.data());
+    std::perror("execv");
+    ::_exit(127);
+  }
+
+  ::close(stdout_pipe[1]);
+  ::close(stderr_pipe[1]);
+  return child_process{pid, stdout_pipe[0], stderr_pipe[0]};
+}
+
+std::string wait_for_child_uri(child_process &child, int timeout_ms) {
+  std::string line;
+  if (read_line_with_timeout(child.stdout_fd, line, timeout_ms)) {
+    return holons::trim_copy(line);
+  }
+  auto stderr_text = read_available(child.stderr_fd);
+  throw std::runtime_error("child did not advertise a URI: " + stderr_text);
+}
+
+bool pid_exists(pid_t pid) {
+  if (pid <= 0) {
+    return false;
+  }
+  return ::kill(pid, 0) == 0 || errno == EPERM;
+}
+
+void wait_for_process_exit(pid_t pid, int timeout_ms = 2000) {
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!pid_exists(pid)) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  assert(false && "process still running after timeout");
+}
+
+int reserve_loopback_port() {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  assert(fd >= 0);
+
+  int one = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(0);
+  assert(::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
+  assert(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  assert(::listen(fd, 1) == 0);
+
+  socklen_t len = sizeof(addr);
+  assert(::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
+  int port = ntohs(addr.sin_port);
+  ::close(fd);
+  return port;
+}
+
+std::string connect_slug(const std::string &given_name,
+                         const std::string &family_name) {
+  auto join = given_name + "-" + family_name;
+  std::string slug;
+  slug.reserve(join.size());
+  for (char ch : join) {
+    if (std::isspace(static_cast<unsigned char>(ch))) {
+      slug.push_back('-');
+    } else {
+      slug.push_back(static_cast<char>(
+          std::tolower(static_cast<unsigned char>(ch))));
+    }
+  }
+  return slug;
+}
+
+struct connect_fixture {
+  std::filesystem::path root;
+  std::string slug;
+  std::filesystem::path pid_file;
+  std::filesystem::path binary_path;
+};
+
+connect_fixture write_connect_fixture(const std::string &given_name,
+                                      const std::string &family_name) {
+  auto root = make_temp_dir("holons_cpp_connect_");
+  auto slug = connect_slug(given_name, family_name);
+  auto pid_file = root / (slug + ".pid");
+  auto binary_path = root / (slug + "-server.sh");
+  auto sdk_root = std::filesystem::path(find_sdk_dir()) / "cpp-holons";
+  auto echo_server = sdk_root / "bin" / "echo-server";
+
+  {
+    std::ofstream script(binary_path);
+    assert(script.is_open());
+    script << "#!/usr/bin/env bash\n"
+           << "set -euo pipefail\n"
+           << "echo $$ > " << pid_file << "\n"
+           << "exec " << echo_server << " \"$@\"\n";
+  }
+  assert(::chmod(binary_path.c_str(), 0700) == 0);
+
+  auto holon_dir = root / "holons" / slug;
+  std::filesystem::create_directories(holon_dir);
+  {
+    std::ofstream manifest(holon_dir / "holon.yaml");
+    assert(manifest.is_open());
+    manifest << "uuid: \"" << slug << "-uuid\"\n"
+             << "given_name: \"" << given_name << "\"\n"
+             << "family_name: \"" << family_name << "\"\n"
+             << "composer: \"connect-test\"\n"
+             << "kind: service\n"
+             << "build:\n"
+             << "  runner: shell\n"
+             << "artifacts:\n"
+             << "  binary: " << binary_path << "\n";
+  }
+
+  return connect_fixture{root, slug, pid_file, binary_path};
+}
+
+void write_port_file(const std::filesystem::path &path, const std::string &uri) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path);
+  assert(out.is_open());
+  out << holons::trim_copy(uri) << "\n";
+}
+
+pid_t read_pid_file(const std::filesystem::path &path) {
+  for (int i = 0; i < 80; ++i) {
+    std::ifstream in(path);
+    pid_t pid = -1;
+    if (in.is_open() && (in >> pid) && pid > 0) {
+      return pid;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  return -1;
+}
+
+#if HOLONS_HAS_GRPCPP
+bool channel_ready(const std::shared_ptr<grpc::Channel> &channel,
+                   int timeout_ms = 1000) {
+  if (!channel) {
+    return false;
+  }
+  auto deadline = std::chrono::system_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
+  return channel->WaitForConnected(deadline);
+}
+#endif
+
 const char *kGoHolonRPCServerSource = R"GO(
 package main
 
@@ -1480,6 +1723,164 @@ int main() {
     std::filesystem::remove_all(root);
     std::filesystem::remove_all(op_root);
   }
+
+  // --- connect ---
+#if HOLONS_HAS_GRPCPP
+  if (bind_restricted) {
+    std::fprintf(stderr, "SKIP: connect direct dial (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+    std::fprintf(stderr, "SKIP: connect ephemeral slug startup (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+    std::fprintf(stderr, "SKIP: connect persistent port-file startup (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+    std::fprintf(stderr, "SKIP: connect port-file reuse (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+    std::fprintf(stderr, "SKIP: connect stale port-file recovery (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+  } else {
+    auto sdk_root = std::filesystem::path(find_sdk_dir()) / "cpp-holons";
+    auto echo_server = (sdk_root / "bin" / "echo-server").string();
+
+    {
+      auto server = start_child_process(
+          echo_server, {"--listen", "tcp://127.0.0.1:0"});
+      auto uri = wait_for_child_uri(server, 20000);
+      auto parsed = holons::parse_uri(uri);
+      auto direct_target = parsed.host + ":" + std::to_string(parsed.port);
+
+      auto channel = holons::connect(direct_target);
+      assert(channel_ready(channel, 2000));
+      ++passed;
+      holons::disconnect(channel);
+      assert(pid_exists(server.pid));
+      ++passed;
+    }
+
+    {
+      auto fixture = write_connect_fixture("Connect", "Ephemeral");
+      cwd_guard cwd(fixture.root);
+      env_guard oppath("OPPATH", (fixture.root / ".op-home").string());
+      env_guard opbin("OPBIN", (fixture.root / ".op-bin").string());
+
+      auto channel = holons::connect(fixture.slug);
+      assert(channel_ready(channel, 2000));
+      ++passed;
+
+      auto pid = read_pid_file(fixture.pid_file);
+      assert(pid > 0);
+      ++passed;
+
+      holons::disconnect(channel);
+      wait_for_process_exit(pid);
+      ++passed;
+
+      auto port_file =
+          fixture.root / ".op" / "run" / (fixture.slug + ".port");
+      assert(!std::filesystem::exists(port_file));
+      ++passed;
+    }
+
+    {
+      auto fixture = write_connect_fixture("Connect", "Persistent");
+      cwd_guard cwd(fixture.root);
+      env_guard oppath("OPPATH", (fixture.root / ".op-home").string());
+      env_guard opbin("OPBIN", (fixture.root / ".op-bin").string());
+
+      holons::ConnectOptions opts;
+      opts.timeout_ms = 5000;
+      auto channel = holons::connect(fixture.slug, opts);
+      assert(channel_ready(channel, 2000));
+      ++passed;
+
+      auto pid = read_pid_file(fixture.pid_file);
+      assert(pid > 0);
+      ++passed;
+
+      auto port_file =
+          fixture.root / ".op" / "run" / (fixture.slug + ".port");
+      assert(std::filesystem::exists(port_file));
+      ++passed;
+
+      auto advertised = holons::trim_copy(read_file_text(port_file.string()));
+      assert(advertised.rfind("tcp://127.0.0.1:", 0) == 0);
+      ++passed;
+
+      holons::disconnect(channel);
+      assert(pid_exists(pid));
+      ++passed;
+
+      auto reused = holons::connect(fixture.slug);
+      assert(channel_ready(reused, 2000));
+      ++passed;
+
+      holons::disconnect(reused);
+      assert(pid_exists(pid));
+      ++passed;
+
+      assert(::kill(pid, SIGTERM) == 0);
+      wait_for_process_exit(pid);
+      ++passed;
+    }
+
+    {
+      auto fixture = write_connect_fixture("Connect", "Reuse");
+      cwd_guard cwd(fixture.root);
+      env_guard oppath("OPPATH", (fixture.root / ".op-home").string());
+      env_guard opbin("OPBIN", (fixture.root / ".op-bin").string());
+
+      auto server = start_child_process(
+          echo_server, {"--listen", "tcp://127.0.0.1:0"});
+      auto uri = wait_for_child_uri(server, 20000);
+      auto port_file =
+          fixture.root / ".op" / "run" / (fixture.slug + ".port");
+      write_port_file(port_file, uri);
+
+      auto channel = holons::connect(fixture.slug);
+      assert(channel_ready(channel, 2000));
+      ++passed;
+
+      holons::disconnect(channel);
+      assert(pid_exists(server.pid));
+      ++passed;
+    }
+
+    {
+      auto fixture = write_connect_fixture("Connect", "Stale");
+      cwd_guard cwd(fixture.root);
+      env_guard oppath("OPPATH", (fixture.root / ".op-home").string());
+      env_guard opbin("OPBIN", (fixture.root / ".op-bin").string());
+
+      auto port_file =
+          fixture.root / ".op" / "run" / (fixture.slug + ".port");
+      write_port_file(
+          port_file,
+          "tcp://127.0.0.1:" + std::to_string(reserve_loopback_port()));
+
+      auto channel = holons::connect(fixture.slug);
+      assert(channel_ready(channel, 2000));
+      ++passed;
+
+      auto pid = read_pid_file(fixture.pid_file);
+      assert(pid > 0);
+      ++passed;
+
+      assert(!std::filesystem::exists(port_file));
+      ++passed;
+
+      holons::disconnect(channel);
+      wait_for_process_exit(pid);
+      ++passed;
+    }
+  }
+#else
+  std::fprintf(stderr, "SKIP: connect tests (grpc++ headers unavailable)\n");
+  ++passed;
+#endif
 
   // --- holon-rpc server interop (cpp wrapper) ---
   if (bind_restricted) {
