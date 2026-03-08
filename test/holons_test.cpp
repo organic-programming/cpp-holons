@@ -1,3 +1,4 @@
+#include "../include/holons/describe.hpp"
 #include "../include/holons/holons.hpp"
 
 namespace {
@@ -31,6 +32,44 @@ void write_discovery_holon(const std::filesystem::path &dir,
       << "  runner: go-module\n"
       << "artifacts:\n"
       << "  binary: " << binary << "\n";
+}
+
+void write_echo_holon(const std::filesystem::path &dir) {
+  std::filesystem::create_directories(dir / "protos" / "echo" / "v1");
+
+  {
+    std::ofstream holon(dir / "holon.yaml");
+    holon << "given_name: Echo\n"
+          << "family_name: Server\n"
+          << "motto: Reply precisely.\n";
+  }
+
+  {
+    std::ofstream proto(dir / "protos" / "echo" / "v1" / "echo.proto");
+    proto << "syntax = \"proto3\";\n"
+          << "package echo.v1;\n\n"
+          << "// Echo echoes request payloads for documentation tests.\n"
+          << "service Echo {\n"
+          << "  // Ping echoes the inbound message.\n"
+          << "  // @example {\"message\":\"hello\",\"sdk\":\"go-holons\"}\n"
+          << "  rpc Ping(PingRequest) returns (PingResponse);\n"
+          << "}\n\n"
+          << "message PingRequest {\n"
+          << "  // Message to echo back.\n"
+          << "  // @required\n"
+          << "  // @example \"hello\"\n"
+          << "  string message = 1;\n\n"
+          << "  // SDK marker included in the response.\n"
+          << "  // @example \"go-holons\"\n"
+          << "  string sdk = 2;\n"
+          << "}\n\n"
+          << "message PingResponse {\n"
+          << "  // Echoed message.\n"
+          << "  string message = 1;\n\n"
+          << "  // SDK marker from the server.\n"
+          << "  string sdk = 2;\n"
+          << "}\n";
+  }
 }
 
 std::optional<std::string> capture_env(const char *name) {
@@ -210,6 +249,66 @@ int main() {
   assert(id.given_name == "test");
   ++passed;
   std::filesystem::remove(temp_path);
+
+  auto describe_root = make_temp_dir("holons_cpp_describe_windows_");
+  write_echo_holon(describe_root);
+
+  auto response = holons::describe::build_response(
+      describe_root / "protos", describe_root / "holon.yaml");
+  assert(response.slug == "echo-server");
+  ++passed;
+  assert(response.motto == "Reply precisely.");
+  ++passed;
+  assert(response.services.size() == 1);
+  ++passed;
+  assert(response.services[0].name == "echo.v1.Echo");
+  ++passed;
+  assert(response.services[0].description ==
+         "Echo echoes request payloads for documentation tests.");
+  ++passed;
+  assert(response.services[0].methods.size() == 1);
+  ++passed;
+  assert(response.services[0].methods[0].name == "Ping");
+  ++passed;
+  assert(response.services[0].methods[0].example_input ==
+         "{\"message\":\"hello\",\"sdk\":\"go-holons\"}");
+  ++passed;
+  assert(response.services[0].methods[0].input_fields.size() == 2);
+  ++passed;
+  assert(response.services[0].methods[0].input_fields[0].name == "message");
+  ++passed;
+  assert(response.services[0].methods[0].input_fields[0].label ==
+         holons::describe::field_label::required);
+  ++passed;
+  assert(response.services[0].methods[0].input_fields[0].example == "\"hello\"");
+  ++passed;
+
+  auto registration = holons::describe::make_registration(
+      describe_root / "protos", describe_root / "holon.yaml");
+  assert(registration.service_name == "holonmeta.v1.HolonMeta");
+  ++passed;
+  assert(registration.method_name == "Describe");
+  ++passed;
+  auto registered =
+      registration.handler(holons::describe::describe_request{});
+  assert(registered.services.size() == 1);
+  ++passed;
+
+  auto empty_root = make_temp_dir("holons_cpp_describe_empty_windows_");
+  {
+    std::ofstream holon(empty_root / "holon.yaml");
+    holon << "given_name: Empty\n"
+          << "family_name: Holon\n"
+          << "motto: Still available.\n";
+  }
+  auto empty_response = holons::describe::build_response(
+      empty_root / "protos", empty_root / "holon.yaml");
+  assert(empty_response.slug == "empty-holon");
+  ++passed;
+  assert(empty_response.services.empty());
+  ++passed;
+  std::filesystem::remove_all(describe_root);
+  std::filesystem::remove_all(empty_root);
 
   auto discover_root = make_temp_dir("holons_cpp_windows_discover_");
   write_discovery_holon(discover_root / "holons" / "alpha", "uuid-alpha", "Alpha",
@@ -1641,6 +1740,96 @@ int main() {
     assert(id.lang == "cpp");
     ++passed;
     std::remove(path.c_str());
+  }
+
+  // --- describe ---
+  {
+    auto root = make_temp_dir("holons_cpp_describe_");
+    write_echo_holon(root);
+
+    auto response = holons::describe::build_response(root / "protos",
+                                                     root / "holon.yaml");
+    assert(response.slug == "echo-server");
+    ++passed;
+    assert(response.motto == "Reply precisely.");
+    ++passed;
+    assert(response.services.size() == 1);
+    ++passed;
+
+    const auto &service = response.services[0];
+    assert(service.name == "echo.v1.Echo");
+    ++passed;
+    assert(service.description ==
+           "Echo echoes request payloads for documentation tests.");
+    ++passed;
+    assert(service.methods.size() == 1);
+    ++passed;
+
+    const auto &method = service.methods[0];
+    assert(method.name == "Ping");
+    ++passed;
+    assert(method.description == "Ping echoes the inbound message.");
+    ++passed;
+    assert(method.input_type == "echo.v1.PingRequest");
+    ++passed;
+    assert(method.output_type == "echo.v1.PingResponse");
+    ++passed;
+    assert(method.example_input == "{\"message\":\"hello\",\"sdk\":\"go-holons\"}");
+    ++passed;
+    assert(method.input_fields.size() == 2);
+    ++passed;
+    assert(method.input_fields[0].name == "message");
+    ++passed;
+    assert(method.input_fields[0].type == "string");
+    ++passed;
+    assert(method.input_fields[0].number == 1);
+    ++passed;
+    assert(method.input_fields[0].description == "Message to echo back.");
+    ++passed;
+    assert(method.input_fields[0].label ==
+           holons::describe::field_label::required);
+    ++passed;
+    assert(method.input_fields[0].required);
+    ++passed;
+    assert(method.input_fields[0].example == "\"hello\"");
+    ++passed;
+
+    auto registration = holons::describe::make_registration(
+        root / "protos", root / "holon.yaml");
+    assert(registration.service_name == "holonmeta.v1.HolonMeta");
+    ++passed;
+    assert(registration.method_name == "Describe");
+    ++passed;
+    auto registered =
+        registration.handler(holons::describe::describe_request{});
+    assert(registered.slug == "echo-server");
+    ++passed;
+    assert(registered.services.size() == 1);
+    ++passed;
+
+    std::filesystem::remove_all(root);
+  }
+
+  // --- describe without protos ---
+  {
+    auto root = make_temp_dir("holons_cpp_describe_empty_");
+    {
+      std::ofstream holon(root / "holon.yaml");
+      holon << "given_name: Empty\n"
+            << "family_name: Holon\n"
+            << "motto: Still available.\n";
+    }
+
+    auto response = holons::describe::build_response(root / "protos",
+                                                     root / "holon.yaml");
+    assert(response.slug == "empty-holon");
+    ++passed;
+    assert(response.motto == "Still available.");
+    ++passed;
+    assert(response.services.empty());
+    ++passed;
+
+    std::filesystem::remove_all(root);
   }
 
   // --- parse_holon invalid mapping ---
