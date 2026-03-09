@@ -748,6 +748,7 @@ struct connect_fixture {
   std::filesystem::path root;
   std::string slug;
   std::filesystem::path pid_file;
+  std::filesystem::path args_file;
   std::filesystem::path binary_path;
 };
 
@@ -756,6 +757,7 @@ connect_fixture write_connect_fixture(const std::string &given_name,
   auto root = make_temp_dir("holons_cpp_connect_");
   auto slug = connect_slug(given_name, family_name);
   auto pid_file = root / (slug + ".pid");
+  auto args_file = root / (slug + ".args");
   auto binary_path = root / (slug + "-server.sh");
   auto sdk_root = std::filesystem::path(find_sdk_dir()) / "cpp-holons";
   auto echo_server = sdk_root / "bin" / "echo-server";
@@ -766,6 +768,8 @@ connect_fixture write_connect_fixture(const std::string &given_name,
     script << "#!/usr/bin/env bash\n"
            << "set -euo pipefail\n"
            << "echo $$ > " << pid_file << "\n"
+           << ": > " << args_file << "\n"
+           << "for arg in \"$@\"; do echo \"$arg\" >> " << args_file << "; done\n"
            << "exec " << echo_server << " \"$@\"\n";
   }
   assert(::chmod(binary_path.c_str(), 0700) == 0);
@@ -786,7 +790,7 @@ connect_fixture write_connect_fixture(const std::string &given_name,
              << "  binary: " << binary_path << "\n";
   }
 
-  return connect_fixture{root, slug, pid_file, binary_path};
+  return connect_fixture{root, slug, pid_file, args_file, binary_path};
 }
 
 void write_port_file(const std::filesystem::path &path, const std::string &uri) {
@@ -1964,6 +1968,10 @@ int main() {
       assert(pid > 0);
       ++passed;
 
+      assert(holons::trim_copy(read_file_text(fixture.args_file.string())) ==
+             "serve\n--listen\nstdio://");
+      ++passed;
+
       holons::disconnect(channel);
       wait_for_process_exit(pid);
       ++passed;
@@ -1982,6 +1990,7 @@ int main() {
 
       holons::ConnectOptions opts;
       opts.timeout_ms = 5000;
+      opts.transport = "tcp";
       auto channel = holons::connect(fixture.slug, opts);
       assert(channel_ready(channel, 2000));
       ++passed;
