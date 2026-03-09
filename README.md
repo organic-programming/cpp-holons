@@ -31,6 +31,9 @@ make test
 | `holons::discover_all()` | Discover from local, `$OPBIN`, and cache roots |
 | `holons::find_by_slug(slug)` | Resolve a holon by slug |
 | `holons::find_by_uuid(prefix)` | Resolve a holon by UUID prefix |
+| `holons::connect(target)` | Dial a direct target or auto-start a holon by slug |
+| `holons::disconnect(channel)` | Stop any process started by `connect()` |
+| `holons::channel_target(channel)` | Read the resolved direct target for a connected channel |
 | `holons::holon_rpc_client` | Holon-RPC client |
 
 ## Current scope
@@ -38,9 +41,10 @@ make test
 - Runtime transports: `tcp://`, `unix://`, `stdio://`, `mem://`
 - `ws://` and `wss://` are metadata-only at the transport layer
 - Discovery scans local, `$OPBIN`, and cache roots
+- `connect()` supports both direct targets and slug-based startup on POSIX
 
 ## Current gaps vs Go
 
-- No generic slug-based `connect()` helper yet.
 - No full gRPC `serve` lifecycle helper yet.
 - No Holon-RPC server module yet.
+- No generated service-specific client bindings; recipes still own RPC wiring.

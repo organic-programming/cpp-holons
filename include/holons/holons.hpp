@@ -1764,6 +1764,7 @@ struct process_handle {
 struct channel_handle {
   std::shared_ptr<process_handle> process;
   bool ephemeral = false;
+  std::string target;
 };
 
 inline std::mutex &started_mutex() {
@@ -2266,7 +2267,10 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
   }
 
   if (connect_detail::is_direct_target(trimmed)) {
-    return connect_detail::dial_ready(trimmed, opts.timeout_ms);
+    auto channel = connect_detail::dial_ready(trimmed, opts.timeout_ms);
+    connect_detail::remember(
+        channel, connect_detail::channel_handle{nullptr, false, trimmed});
+    return channel;
   }
 
   auto entry = find_by_slug(trimmed);
@@ -2280,7 +2284,10 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
   if (auto existing =
           connect_detail::usable_port_file(port_file, opts.timeout_ms);
       existing.has_value()) {
-    return connect_detail::dial_ready(*existing, opts.timeout_ms);
+    auto channel = connect_detail::dial_ready(*existing, opts.timeout_ms);
+    connect_detail::remember(
+        channel, connect_detail::channel_handle{nullptr, false, *existing});
+    return channel;
   }
 
   if (!opts.start) {
@@ -2304,7 +2311,8 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
     throw;
   }
   connect_detail::remember(channel,
-                           connect_detail::channel_handle{process, ephemeral});
+                           connect_detail::channel_handle{process, ephemeral,
+                                                          started_uri});
   return channel;
 }
 
@@ -2338,6 +2346,20 @@ inline void disconnect(std::shared_ptr<grpc::Channel> channel) {
   if (found && handle.process != nullptr && handle.ephemeral) {
     connect_detail::stop_process(handle.process);
   }
+}
+
+inline std::string channel_target(const std::shared_ptr<grpc::Channel> &channel) {
+  if (!channel) {
+    return {};
+  }
+
+  std::lock_guard<std::mutex> lock(connect_detail::started_mutex());
+  auto &started = connect_detail::started_channels();
+  auto it = started.find(channel.get());
+  if (it == started.end()) {
+    return {};
+  }
+  return it->second.target;
 }
 
 } // namespace holons
