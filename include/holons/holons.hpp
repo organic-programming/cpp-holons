@@ -25,6 +25,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #ifdef _MSC_VER
@@ -90,7 +91,66 @@ inline std::shared_ptr<Channel>
 CreateChannel(const std::string &, std::shared_ptr<ChannelCredentials>) {
   return std::make_shared<Channel>();
 }
+
+class ServerCredentials {
+public:
+  virtual ~ServerCredentials() = default;
+};
+
+class ServerContext {
+public:
+  virtual ~ServerContext() = default;
+};
+
+class Service {
+public:
+  virtual ~Service() = default;
+};
+
+class Status {
+public:
+  Status() = default;
+};
+
+class Server {
+public:
+  virtual ~Server() = default;
+
+  template <typename Deadline>
+  void Shutdown(const Deadline &) {}
+
+  void Wait() {}
+};
+
+class ServerBuilder {
+public:
+  void AddListeningPort(const std::string &, std::shared_ptr<ServerCredentials>,
+                        int *selected_port = nullptr) {
+    if (selected_port != nullptr) {
+      *selected_port = 0;
+    }
+  }
+
+  void RegisterService(Service *) {}
+
+  std::unique_ptr<Server> BuildAndStart() {
+    return std::make_unique<Server>();
+  }
+};
+
+inline std::shared_ptr<ServerCredentials> InsecureServerCredentials() {
+  return std::make_shared<ServerCredentials>();
+}
 } // namespace grpc
+#endif
+#if HOLONS_HAS_GRPCPP && !defined(_WIN32) &&                                   \
+    __has_include(<grpcpp/create_channel_posix.h>) &&                          \
+    __has_include(<grpcpp/server_posix.h>)
+#include <grpcpp/create_channel_posix.h>
+#include <grpcpp/server_posix.h>
+#define HOLONS_HAS_GRPC_FD 1
+#else
+#define HOLONS_HAS_GRPC_FD 0
 #endif
 #include <random>
 #include <sstream>
@@ -1746,7 +1806,11 @@ inline std::optional<HolonEntry> find_by_uuid(const std::string &prefix) {
 
 struct ConnectOptions {
   int timeout_ms = 5000;
+#ifdef _WIN32
+  std::string transport = "tcp";
+#else
   std::string transport = "stdio";
+#endif
   bool start = true;
   std::string port_file;
 };
@@ -1756,6 +1820,19 @@ namespace connect_detail {
 struct process_handle {
 #ifdef _WIN32
   intptr_t pid = 0;
+  HANDLE process = nullptr;
+  HANDLE thread = nullptr;
+  HANDLE stdin_handle = nullptr;
+  HANDLE stdout_handle = nullptr;
+  HANDLE stderr_handle = nullptr;
+  int listener_fd = -1;
+  int client_fd = -1;
+  std::atomic<bool> closed{false};
+  std::mutex client_mutex;
+  std::mutex stderr_mutex;
+  std::string stderr_capture;
+  std::thread accept_thread;
+  std::thread stderr_thread;
 #else
   pid_t pid = -1;
   int stdin_fd = -1;
@@ -1770,6 +1847,12 @@ struct process_handle {
   std::thread accept_thread;
   std::thread stderr_thread;
 #endif
+};
+
+struct startup_result {
+  std::string target;
+  int direct_fd = -1;
+  std::shared_ptr<process_handle> process;
 };
 
 struct channel_handle {
@@ -1823,21 +1906,43 @@ inline std::string normalize_dial_target(const std::string &target) {
 
 inline std::shared_ptr<grpc::Channel> dial_ready(const std::string &target,
                                                  int timeout_ms) {
+#if !HOLONS_HAS_GRPCPP
+  (void)target;
+  (void)timeout_ms;
+  throw std::runtime_error("grpc++ headers are required for connect()");
+#else
   auto channel = grpc::CreateChannel(normalize_dial_target(target),
                                      grpc::InsecureChannelCredentials());
   if (!channel) {
     throw std::runtime_error("grpc::CreateChannel returned null");
   }
-#if HOLONS_HAS_GRPCPP
   auto deadline = std::chrono::system_clock::now() +
                   std::chrono::milliseconds(std::max(timeout_ms, 1));
   if (!channel->WaitForConnected(deadline)) {
     throw std::runtime_error("timed out waiting for gRPC readiness");
   }
-#else
-  (void)timeout_ms;
-#endif
   return channel;
+#endif
+}
+
+inline std::shared_ptr<grpc::Channel> dial_ready_from_fd(int fd, int timeout_ms) {
+#if HOLONS_HAS_GRPC_FD
+  auto channel = grpc::CreateInsecureChannelFromFd("stdio://", fd);
+  if (!channel) {
+    close_fd(fd, true);
+    throw std::runtime_error("grpc::CreateInsecureChannelFromFd returned null");
+  }
+  auto deadline = std::chrono::system_clock::now() +
+                  std::chrono::milliseconds(std::max(timeout_ms, 1));
+  if (!channel->WaitForConnected(deadline)) {
+    throw std::runtime_error("timed out waiting for gRPC readiness");
+  }
+  return channel;
+#else
+  close_fd(fd, true);
+  (void)timeout_ms;
+  throw std::runtime_error("direct stdio gRPC transport is unavailable");
+#endif
 }
 
 inline void remember(const std::shared_ptr<grpc::Channel> &channel,
@@ -1899,7 +2004,359 @@ usable_port_file(const std::filesystem::path &path, int timeout_ms) {
   }
 }
 
+inline std::string first_uri(const std::string &line) {
+  std::istringstream in(line);
+  std::string field;
+  while (in >> field) {
+    while (!field.empty() &&
+           std::string("\"'()[]{}.,").find(field.front()) != std::string::npos) {
+      field.erase(field.begin());
+    }
+    while (!field.empty() &&
+           std::string("\"'()[]{}.,").find(field.back()) != std::string::npos) {
+      field.pop_back();
+    }
+
+    if (field.rfind("tcp://", 0) == 0 || field.rfind("unix://", 0) == 0 ||
+        field.rfind("ws://", 0) == 0 || field.rfind("wss://", 0) == 0 ||
+        field.rfind("stdio://", 0) == 0) {
+      return field;
+    }
+  }
+  return "";
+}
+
+inline std::optional<std::string> drain_startup_buffer(std::string *buffer,
+                                                       std::string *capture,
+                                                       bool flush_tail) {
+  size_t end = buffer->find('\n');
+  while (end != std::string::npos) {
+    auto line = buffer->substr(0, end);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    capture->append(line);
+    capture->push_back('\n');
+
+    if (auto uri = first_uri(line); !uri.empty()) {
+      buffer->erase(0, end + 1);
+      return uri;
+    }
+    buffer->erase(0, end + 1);
+    end = buffer->find('\n');
+  }
+
+  if (flush_tail && !buffer->empty()) {
+    auto line = *buffer;
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    capture->append(line);
+    if (auto uri = first_uri(line); !uri.empty()) {
+      buffer->clear();
+      return uri;
+    }
+    buffer->clear();
+  }
+
+  return std::nullopt;
+}
+
+inline void join_thread(std::thread *thread) {
+  if (thread != nullptr && thread->joinable()) {
+    thread->join();
+  }
+}
+
+inline std::string stderr_text(const std::shared_ptr<process_handle> &process) {
+  if (process == nullptr) {
+    return "";
+  }
+  std::lock_guard<std::mutex> lock(process->stderr_mutex);
+  return trim_copy(process->stderr_capture);
+}
+
 #ifdef _WIN32
+inline void close_pipe_handle(HANDLE *handle) {
+  if (handle == nullptr) {
+    return;
+  }
+  if (*handle != nullptr && *handle != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(*handle);
+  }
+  *handle = nullptr;
+}
+
+inline std::string win32_error_message(const std::string &prefix, DWORD code) {
+  return prefix + ": win32 error " + std::to_string(code);
+}
+
+inline std::wstring widen_utf8(const std::string &value) {
+  if (value.empty()) {
+    return {};
+  }
+  int size =
+      ::MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+  if (size <= 0) {
+    throw std::runtime_error("failed to convert UTF-8 to UTF-16");
+  }
+  std::wstring wide(static_cast<size_t>(size), L'\0');
+  if (::MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, wide.data(),
+                            size) <= 0) {
+    throw std::runtime_error("failed to convert UTF-8 to UTF-16");
+  }
+  wide.resize(static_cast<size_t>(size - 1));
+  return wide;
+}
+
+inline std::wstring quote_windows_arg(const std::wstring &arg) {
+  if (arg.empty()) {
+    return L"\"\"";
+  }
+
+  bool needs_quotes = false;
+  for (wchar_t ch : arg) {
+    if (ch == L' ' || ch == L'\t' || ch == L'"') {
+      needs_quotes = true;
+      break;
+    }
+  }
+  if (!needs_quotes) {
+    return arg;
+  }
+
+  std::wstring out;
+  out.push_back(L'"');
+  size_t backslashes = 0;
+  for (wchar_t ch : arg) {
+    if (ch == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (ch == L'"') {
+      out.append(backslashes * 2 + 1, L'\\');
+      out.push_back(L'"');
+      backslashes = 0;
+      continue;
+    }
+    out.append(backslashes, L'\\');
+    backslashes = 0;
+    out.push_back(ch);
+  }
+  out.append(backslashes * 2, L'\\');
+  out.push_back(L'"');
+  return out;
+}
+
+inline std::wstring build_command_line(const std::string &binary_path,
+                                       const std::vector<std::string> &args) {
+  std::wstring command = quote_windows_arg(widen_utf8(binary_path));
+  for (const auto &arg : args) {
+    command.push_back(L' ');
+    command += quote_windows_arg(widen_utf8(arg));
+  }
+  return command;
+}
+
+inline void create_pipe_pair(HANDLE *read_handle, HANDLE *write_handle) {
+  SECURITY_ATTRIBUTES attrs{};
+  attrs.nLength = sizeof(attrs);
+  attrs.bInheritHandle = TRUE;
+  attrs.lpSecurityDescriptor = nullptr;
+
+  if (!::CreatePipe(read_handle, write_handle, &attrs, 0)) {
+    throw std::runtime_error(
+        win32_error_message("CreatePipe failed", ::GetLastError()));
+  }
+}
+
+inline void set_no_inherit(HANDLE handle) {
+  if (handle != nullptr && handle != INVALID_HANDLE_VALUE &&
+      !::SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) {
+    throw std::runtime_error(
+        win32_error_message("SetHandleInformation failed", ::GetLastError()));
+  }
+}
+
+inline void read_available_pipe(HANDLE handle, std::string *target, bool *closed) {
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE || target == nullptr) {
+    return;
+  }
+
+  for (;;) {
+    DWORD available = 0;
+    if (!::PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
+      DWORD error = ::GetLastError();
+      if (closed != nullptr &&
+          (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)) {
+        *closed = true;
+      }
+      return;
+    }
+    if (available == 0) {
+      return;
+    }
+
+    std::array<char, 512> buffer{};
+    DWORD to_read =
+        std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+    DWORD read = 0;
+    if (!::ReadFile(handle, buffer.data(), to_read, &read, nullptr) ||
+        read == 0) {
+      DWORD error = ::GetLastError();
+      if (closed != nullptr &&
+          (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)) {
+        *closed = true;
+      }
+      return;
+    }
+    target->append(buffer.data(), static_cast<size_t>(read));
+  }
+}
+
+inline void drain_handle(HANDLE handle, std::string *target) {
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE || target == nullptr) {
+    return;
+  }
+
+  std::array<char, 512> buffer{};
+  for (;;) {
+    DWORD read = 0;
+    if (!::ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()),
+                    &read, nullptr) ||
+        read == 0) {
+      return;
+    }
+    target->append(buffer.data(), static_cast<size_t>(read));
+  }
+}
+
+inline void relay_socket_to_handle(int read_fd, HANDLE write_handle) {
+  std::array<char, 16 * 1024> buffer{};
+  for (;;) {
+    int received = ::recv(static_cast<SOCKET>(read_fd), buffer.data(),
+                          static_cast<int>(buffer.size()), 0);
+    if (received <= 0) {
+      return;
+    }
+
+    int offset = 0;
+    while (offset < received) {
+      DWORD written = 0;
+      if (!::WriteFile(write_handle, buffer.data() + offset,
+                       static_cast<DWORD>(received - offset), &written,
+                       nullptr) ||
+          written == 0) {
+        return;
+      }
+      offset += static_cast<int>(written);
+    }
+  }
+}
+
+inline void relay_handle_to_socket(HANDLE read_handle, int write_fd) {
+  std::array<char, 16 * 1024> buffer{};
+  for (;;) {
+    DWORD read = 0;
+    if (!::ReadFile(read_handle, buffer.data(), static_cast<DWORD>(buffer.size()),
+                    &read, nullptr) ||
+        read == 0) {
+      return;
+    }
+
+    DWORD offset = 0;
+    while (offset < read) {
+      int written =
+          ::send(static_cast<SOCKET>(write_fd), buffer.data() + offset,
+                 static_cast<int>(read - offset), 0);
+      if (written <= 0) {
+        return;
+      }
+      offset += static_cast<DWORD>(written);
+    }
+  }
+}
+
+inline int create_loopback_listener(std::string *uri) {
+  detail::ensure_winsock();
+
+  SOCKET socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (socket_fd == INVALID_SOCKET) {
+    throw std::runtime_error("socket() failed: " + last_socket_error());
+  }
+
+  int one = 1;
+  (void)::setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char *>(&one), sizeof(one));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(0);
+  if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+    ::closesocket(socket_fd);
+    throw std::runtime_error("inet_pton() failed for loopback listener");
+  }
+  if (::bind(socket_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
+      0) {
+    auto message = last_socket_error();
+    ::closesocket(socket_fd);
+    throw std::runtime_error("bind(loopback) failed: " + message);
+  }
+  if (::listen(socket_fd, 1) != 0) {
+    auto message = last_socket_error();
+    ::closesocket(socket_fd);
+    throw std::runtime_error("listen(loopback) failed: " + message);
+  }
+
+  int len = sizeof(addr);
+  if (::getsockname(socket_fd, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+    auto message = last_socket_error();
+    ::closesocket(socket_fd);
+    throw std::runtime_error("getsockname(loopback) failed: " + message);
+  }
+
+  if (uri != nullptr) {
+    *uri = "tcp://127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
+  }
+  return static_cast<int>(socket_fd);
+}
+
+inline std::shared_ptr<process_handle>
+spawn_child_process(const std::string &binary_path,
+                    const std::vector<std::string> &args, HANDLE stdin_handle,
+                    HANDLE stdout_handle, HANDLE stderr_handle) {
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput =
+      stdin_handle != nullptr ? stdin_handle : ::GetStdHandle(STD_INPUT_HANDLE);
+  startup.hStdOutput = stdout_handle != nullptr
+                           ? stdout_handle
+                           : ::GetStdHandle(STD_OUTPUT_HANDLE);
+  startup.hStdError = stderr_handle != nullptr
+                          ? stderr_handle
+                          : ::GetStdHandle(STD_ERROR_HANDLE);
+
+  PROCESS_INFORMATION info{};
+  auto application = widen_utf8(binary_path);
+  auto command = build_command_line(binary_path, args);
+  std::vector<wchar_t> command_buffer(command.begin(), command.end());
+  command_buffer.push_back(L'\0');
+
+  if (!::CreateProcessW(application.c_str(), command_buffer.data(), nullptr,
+                        nullptr, TRUE, CREATE_NEW_PROCESS_GROUP, nullptr,
+                        nullptr, &startup, &info)) {
+    throw std::runtime_error(
+        win32_error_message("CreateProcessW failed", ::GetLastError()));
+  }
+
+  auto process = std::make_shared<process_handle>();
+  process->pid = static_cast<intptr_t>(info.dwProcessId);
+  process->process = info.hProcess;
+  process->thread = info.hThread;
+  return process;
+}
+
 inline std::string resolve_binary_path(const HolonEntry &entry) {
   if (!entry.manifest.has_value()) {
     throw std::runtime_error("holon \"" + entry.slug + "\" has no manifest");
@@ -1945,13 +2402,276 @@ inline std::string resolve_binary_path(const HolonEntry &entry) {
                            "\"");
 }
 
-inline std::pair<std::string, std::shared_ptr<process_handle>>
-start_tcp_holon(const std::string &, int) {
-  throw std::runtime_error(
-      "slug-based connect() process startup is not implemented on Windows");
+inline bool process_alive(intptr_t pid, HANDLE process) {
+  if (pid <= 0 || process == nullptr) {
+    return false;
+  }
+  return ::WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
 }
 
-inline void stop_process(const std::shared_ptr<process_handle> &) {}
+inline void close_process_io(const std::shared_ptr<process_handle> &process) {
+  if (process == nullptr) {
+    return;
+  }
+
+  process->closed = true;
+
+  if (process->listener_fd >= 0) {
+    close_fd(process->listener_fd, true);
+    process->listener_fd = -1;
+  }
+  {
+    std::lock_guard<std::mutex> lock(process->client_mutex);
+    if (process->client_fd >= 0) {
+      close_fd(process->client_fd, true);
+      process->client_fd = -1;
+    }
+  }
+
+  close_pipe_handle(&process->stdin_handle);
+  close_pipe_handle(&process->stdout_handle);
+  close_pipe_handle(&process->stderr_handle);
+}
+
+inline void close_process_handles(const std::shared_ptr<process_handle> &process) {
+  if (process == nullptr) {
+    return;
+  }
+  close_pipe_handle(&process->thread);
+  close_pipe_handle(&process->process);
+  process->pid = 0;
+}
+
+inline startup_result start_tcp_holon(const std::string &binary_path,
+                                      int timeout_ms) {
+  HANDLE stdout_read = nullptr;
+  HANDLE stdout_write = nullptr;
+  HANDLE stderr_read = nullptr;
+  HANDLE stderr_write = nullptr;
+  HANDLE nul_handle = nullptr;
+
+  create_pipe_pair(&stdout_read, &stdout_write);
+  create_pipe_pair(&stderr_read, &stderr_write);
+  try {
+    set_no_inherit(stdout_read);
+    set_no_inherit(stderr_read);
+    nul_handle = ::CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+    if (nul_handle == INVALID_HANDLE_VALUE) {
+      nul_handle = nullptr;
+    }
+
+    auto process = spawn_child_process(binary_path,
+                                       {"serve", "--listen",
+                                        "tcp://127.0.0.1:0"},
+                                       nul_handle, stdout_write, stderr_write);
+
+    close_pipe_handle(&stdout_write);
+    close_pipe_handle(&stderr_write);
+    close_pipe_handle(&nul_handle);
+
+    std::string stdout_buffer;
+    std::string stderr_buffer;
+    std::string capture;
+    bool stdout_closed = false;
+    bool stderr_closed = false;
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(std::max(timeout_ms, 1));
+
+    while (std::chrono::steady_clock::now() < deadline) {
+      read_available_pipe(stdout_read, &stdout_buffer, &stdout_closed);
+      if (auto uri =
+              drain_startup_buffer(&stdout_buffer, &capture, false);
+          uri.has_value()) {
+        close_pipe_handle(&stdout_read);
+        process->stderr_handle = stderr_read;
+        process->stderr_thread = std::thread([process]() {
+          std::string capture_chunk;
+          drain_handle(process->stderr_handle, &capture_chunk);
+          std::lock_guard<std::mutex> lock(process->stderr_mutex);
+          process->stderr_capture.append(capture_chunk);
+        });
+        return startup_result{*uri, -1, process};
+      }
+
+      read_available_pipe(stderr_read, &stderr_buffer, &stderr_closed);
+      if (auto uri =
+              drain_startup_buffer(&stderr_buffer, &capture, false);
+          uri.has_value()) {
+        close_pipe_handle(&stdout_read);
+        process->stderr_handle = stderr_read;
+        process->stderr_thread = std::thread([process]() {
+          std::string capture_chunk;
+          drain_handle(process->stderr_handle, &capture_chunk);
+          std::lock_guard<std::mutex> lock(process->stderr_mutex);
+          process->stderr_capture.append(capture_chunk);
+        });
+        return startup_result{*uri, -1, process};
+      }
+
+      if (!process_alive(process->pid, process->process)) {
+        process->pid = 0;
+        drain_handle(stdout_read, &stdout_buffer);
+        drain_handle(stderr_read, &stderr_buffer);
+        close_pipe_handle(&stdout_read);
+        close_pipe_handle(&stderr_read);
+        (void)drain_startup_buffer(&stdout_buffer, &capture, true);
+        (void)drain_startup_buffer(&stderr_buffer, &capture, true);
+        close_process_handles(process);
+        throw std::runtime_error(
+            "holon exited before advertising an address: " + trim_copy(capture));
+      }
+
+      if (stdout_closed && stderr_closed) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    ::TerminateProcess(process->process, 1);
+    ::WaitForSingleObject(process->process, 2000);
+    close_process_handles(process);
+    close_pipe_handle(&stdout_read);
+    close_pipe_handle(&stderr_read);
+    throw std::runtime_error("timed out waiting for holon startup");
+  } catch (...) {
+    close_pipe_handle(&stdout_read);
+    close_pipe_handle(&stdout_write);
+    close_pipe_handle(&stderr_read);
+    close_pipe_handle(&stderr_write);
+    close_pipe_handle(&nul_handle);
+    throw;
+  }
+}
+
+inline startup_result start_stdio_holon(const std::string &binary_path,
+                                        int timeout_ms) {
+  HANDLE stdin_read = nullptr;
+  HANDLE stdin_write = nullptr;
+  HANDLE stdout_read = nullptr;
+  HANDLE stdout_write = nullptr;
+  HANDLE stderr_read = nullptr;
+  HANDLE stderr_write = nullptr;
+  std::string proxy_uri;
+  int listener_fd = -1;
+
+  create_pipe_pair(&stdin_read, &stdin_write);
+  create_pipe_pair(&stdout_read, &stdout_write);
+  create_pipe_pair(&stderr_read, &stderr_write);
+  try {
+    set_no_inherit(stdin_write);
+    set_no_inherit(stdout_read);
+    set_no_inherit(stderr_read);
+    listener_fd = create_loopback_listener(&proxy_uri);
+
+    auto process = spawn_child_process(binary_path, {"serve", "--listen", "stdio://"},
+                                       stdin_read, stdout_write, stderr_write);
+
+    close_pipe_handle(&stdin_read);
+    close_pipe_handle(&stdout_write);
+    close_pipe_handle(&stderr_write);
+
+    process->stdin_handle = stdin_write;
+    process->stdout_handle = stdout_read;
+    process->stderr_handle = stderr_read;
+    process->listener_fd = listener_fd;
+
+    process->stderr_thread = std::thread([process]() {
+      std::string capture_chunk;
+      drain_handle(process->stderr_handle, &capture_chunk);
+      std::lock_guard<std::mutex> lock(process->stderr_mutex);
+      process->stderr_capture.append(capture_chunk);
+    });
+
+    process->accept_thread = std::thread([process]() {
+      int accepted = ::accept(process->listener_fd, nullptr, nullptr);
+      if (accepted < 0) {
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(process->client_mutex);
+        if (process->closed) {
+          close_fd(accepted, true);
+          return;
+        }
+        process->client_fd = accepted;
+      }
+
+      std::thread upstream(
+          [process, accepted]() { relay_socket_to_handle(accepted, process->stdin_handle); });
+      std::thread downstream(
+          [process, accepted]() { relay_handle_to_socket(process->stdout_handle, accepted); });
+      join_thread(&upstream);
+      join_thread(&downstream);
+    });
+
+    auto startup_deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(
+                                std::max(1, std::min(timeout_ms, 200)));
+    while (std::chrono::steady_clock::now() < startup_deadline) {
+      if (!process_alive(process->pid, process->process)) {
+        process->pid = 0;
+        auto message = stderr_text(process);
+        close_process_io(process);
+        join_thread(&process->accept_thread);
+        join_thread(&process->stderr_thread);
+        close_process_handles(process);
+        throw std::runtime_error("holon exited before stdio startup" +
+                                 (message.empty() ? std::string()
+                                                  : std::string(": ") + message));
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    return startup_result{proxy_uri, -1, process};
+  } catch (...) {
+    close_pipe_handle(&stdin_read);
+    close_pipe_handle(&stdin_write);
+    close_pipe_handle(&stdout_read);
+    close_pipe_handle(&stdout_write);
+    close_pipe_handle(&stderr_read);
+    close_pipe_handle(&stderr_write);
+    if (listener_fd >= 0) {
+      close_fd(listener_fd, true);
+    }
+    throw;
+  }
+}
+
+inline void stop_process(const std::shared_ptr<process_handle> &process) {
+  if (process == nullptr) {
+    return;
+  }
+  if (process->pid <= 0 || !process_alive(process->pid, process->process)) {
+    close_process_io(process);
+    join_thread(&process->accept_thread);
+    join_thread(&process->stderr_thread);
+    close_process_handles(process);
+    return;
+  }
+
+  close_process_io(process);
+
+  if (!::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT,
+                                  static_cast<DWORD>(process->pid))) {
+    DWORD error = ::GetLastError();
+    if (error != ERROR_INVALID_PARAMETER) {
+      (void)error;
+    }
+  }
+
+  DWORD waited = ::WaitForSingleObject(process->process, 2000);
+  if (waited == WAIT_TIMEOUT) {
+    ::TerminateProcess(process->process, 1);
+    (void)::WaitForSingleObject(process->process, 2000);
+  }
+
+  join_thread(&process->accept_thread);
+  join_thread(&process->stderr_thread);
+  close_process_handles(process);
+}
 #else
 inline bool process_alive(pid_t pid) {
   if (pid <= 0) {
@@ -2026,70 +2746,6 @@ inline std::string resolve_binary_path(const HolonEntry &entry) {
                            "\"");
 }
 
-inline std::string first_uri(const std::string &line) {
-  std::istringstream in(line);
-  std::string field;
-  while (in >> field) {
-    while (!field.empty() &&
-           std::string("\"'()[]{}.,").find(field.front()) != std::string::npos) {
-      field.erase(field.begin());
-    }
-    while (!field.empty() &&
-           std::string("\"'()[]{}.,").find(field.back()) != std::string::npos) {
-      field.pop_back();
-    }
-
-    if (field.rfind("tcp://", 0) == 0 || field.rfind("unix://", 0) == 0 ||
-        field.rfind("ws://", 0) == 0 || field.rfind("wss://", 0) == 0 ||
-        field.rfind("stdio://", 0) == 0) {
-      return field;
-    }
-  }
-  return "";
-}
-
-inline std::optional<std::string> drain_startup_buffer(std::string *buffer,
-                                                       std::string *capture,
-                                                       bool flush_tail) {
-  size_t end = buffer->find('\n');
-  while (end != std::string::npos) {
-    auto line = buffer->substr(0, end);
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-    capture->append(line);
-    capture->push_back('\n');
-
-    if (auto uri = first_uri(line); !uri.empty()) {
-      buffer->erase(0, end + 1);
-      return uri;
-    }
-    buffer->erase(0, end + 1);
-    end = buffer->find('\n');
-  }
-
-  if (flush_tail && !buffer->empty()) {
-    auto line = *buffer;
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-    capture->append(line);
-    if (auto uri = first_uri(line); !uri.empty()) {
-      buffer->clear();
-      return uri;
-    }
-    buffer->clear();
-  }
-
-  return std::nullopt;
-}
-
-inline void join_thread(std::thread *thread) {
-  if (thread != nullptr && thread->joinable()) {
-    thread->join();
-  }
-}
-
 inline void close_process_io(const std::shared_ptr<process_handle> &process) {
   if (process == nullptr) {
     return;
@@ -2120,14 +2776,6 @@ inline void close_process_io(const std::shared_ptr<process_handle> &process) {
     close_fd(process->stderr_fd, false);
     process->stderr_fd = -1;
   }
-}
-
-inline std::string stderr_text(const std::shared_ptr<process_handle> &process) {
-  if (process == nullptr) {
-    return "";
-  }
-  std::lock_guard<std::mutex> lock(process->stderr_mutex);
-  return trim_copy(process->stderr_capture);
 }
 
 inline void relay_fd(int read_fd, int write_fd) {
@@ -2244,8 +2892,8 @@ inline void stop_process(const std::shared_ptr<process_handle> &process) {
   join_thread(&process->stderr_thread);
 }
 
-inline std::pair<std::string, std::shared_ptr<process_handle>>
-start_tcp_holon(const std::string &binary_path, int timeout_ms) {
+inline startup_result start_tcp_holon(const std::string &binary_path,
+                                      int timeout_ms) {
   int stdout_pipe[2] = {-1, -1};
   int stderr_pipe[2] = {-1, -1};
   if (::pipe(stdout_pipe) != 0 || ::pipe(stderr_pipe) != 0) {
@@ -2300,13 +2948,13 @@ start_tcp_holon(const std::string &binary_path, int timeout_ms) {
         uri.has_value()) {
       close_pipe_fd(&stdout_pipe[0]);
       close_pipe_fd(&stderr_pipe[0]);
-      return {*uri, process};
+      return startup_result{*uri, -1, process};
     }
     if (auto uri = drain_startup_buffer(&stderr_buffer, &capture, false);
         uri.has_value()) {
       close_pipe_fd(&stdout_pipe[0]);
       close_pipe_fd(&stderr_pipe[0]);
-      return {*uri, process};
+      return startup_result{*uri, -1, process};
     }
 
     int status = 0;
@@ -2382,8 +3030,100 @@ start_tcp_holon(const std::string &binary_path, int timeout_ms) {
   throw std::runtime_error("timed out waiting for holon startup");
 }
 
-inline std::pair<std::string, std::shared_ptr<process_handle>>
-start_stdio_holon(const std::string &binary_path, int timeout_ms) {
+inline startup_result start_stdio_holon(const std::string &binary_path,
+                                        int timeout_ms) {
+#if HOLONS_HAS_GRPC_FD
+  int transport_pair[2] = {-1, -1};
+  int stderr_pipe[2] = {-1, -1};
+#ifdef _WIN32
+  if (win_socketpair(transport_pair) != 0 || ::pipe(stderr_pipe) != 0) {
+#else
+  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, transport_pair) != 0 ||
+      ::pipe(stderr_pipe) != 0) {
+#endif
+    close_pipe_fd(&stderr_pipe[0]);
+    close_pipe_fd(&stderr_pipe[1]);
+    if (transport_pair[0] >= 0) {
+      close_fd(transport_pair[0], true);
+    }
+    if (transport_pair[1] >= 0) {
+      close_fd(transport_pair[1], true);
+    }
+    throw std::runtime_error("stdio transport setup failed");
+  }
+
+  auto pid = ::fork();
+  if (pid < 0) {
+    close_fd(transport_pair[0], true);
+    close_fd(transport_pair[1], true);
+    close_pipe_fd(&stderr_pipe[0]);
+    close_pipe_fd(&stderr_pipe[1]);
+    throw std::runtime_error("fork() failed");
+  }
+
+  if (pid == 0) {
+    ::dup2(transport_pair[1], STDIN_FILENO);
+    ::dup2(transport_pair[1], STDOUT_FILENO);
+    ::dup2(stderr_pipe[1], STDERR_FILENO);
+    close_fd(transport_pair[0], true);
+    close_fd(transport_pair[1], true);
+    close_pipe_fd(&stderr_pipe[0]);
+    close_pipe_fd(&stderr_pipe[1]);
+
+    std::array<char *, 5> argv{
+        const_cast<char *>(binary_path.c_str()), const_cast<char *>("serve"),
+        const_cast<char *>("--listen"), const_cast<char *>("stdio://"),
+        nullptr};
+    ::execv(binary_path.c_str(), argv.data());
+    std::perror("execv");
+    ::_exit(127);
+  }
+
+  close_fd(transport_pair[1], true);
+  close_pipe_fd(&stderr_pipe[1]);
+
+  auto process = std::make_shared<process_handle>();
+  process->pid = pid;
+  process->stderr_fd = stderr_pipe[0];
+  process->stderr_thread = std::thread([process]() {
+    std::array<char, 4096> buffer{};
+    for (;;) {
+      auto n = ::read(process->stderr_fd, buffer.data(), buffer.size());
+      if (n == 0) {
+        return;
+      }
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return;
+      }
+      std::lock_guard<std::mutex> lock(process->stderr_mutex);
+      process->stderr_capture.append(buffer.data(), static_cast<size_t>(n));
+    }
+  });
+
+  auto startup_deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(
+                              std::max(1, std::min(timeout_ms, 200)));
+  while (std::chrono::steady_clock::now() < startup_deadline) {
+    int status = 0;
+    auto waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid) {
+      process->pid = -1;
+      auto message = stderr_text(process);
+      close_process_io(process);
+      close_fd(transport_pair[0], true);
+      join_thread(&process->stderr_thread);
+      throw std::runtime_error("holon exited before stdio startup" +
+                               (message.empty() ? std::string()
+                                                : std::string(": ") + message));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  return startup_result{"stdio://", transport_pair[0], process};
+#else
   int stdin_pipe[2] = {-1, -1};
   int stdout_pipe[2] = {-1, -1};
   int stderr_pipe[2] = {-1, -1};
@@ -2514,7 +3254,8 @@ start_stdio_holon(const std::string &binary_path, int timeout_ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
-  return {proxy_uri, process};
+  return startup_result{proxy_uri, -1, process};
+#endif
 }
 #endif
 
@@ -2571,23 +3312,28 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
   }
 
   auto binary_path = connect_detail::resolve_binary_path(*entry);
-  auto [started_uri, process] = requested_transport == "stdio"
-                                    ? connect_detail::start_stdio_holon(binary_path, opts.timeout_ms)
-                                    : connect_detail::start_tcp_holon(binary_path, opts.timeout_ms);
+  auto startup = requested_transport == "stdio"
+                     ? connect_detail::start_stdio_holon(binary_path, opts.timeout_ms)
+                     : connect_detail::start_tcp_holon(binary_path, opts.timeout_ms);
 
   std::shared_ptr<grpc::Channel> channel;
   try {
-    channel = connect_detail::dial_ready(started_uri, opts.timeout_ms);
+    if (startup.direct_fd >= 0) {
+      channel =
+          connect_detail::dial_ready_from_fd(startup.direct_fd, opts.timeout_ms);
+    } else {
+      channel = connect_detail::dial_ready(startup.target, opts.timeout_ms);
+    }
     if (!ephemeral_mode && requested_transport == "tcp") {
-      connect_detail::write_port_file(port_file, started_uri);
+      connect_detail::write_port_file(port_file, startup.target);
     }
   } catch (const std::exception &) {
-    connect_detail::stop_process(process);
+    connect_detail::stop_process(startup.process);
     throw;
   }
-  connect_detail::remember(channel,
-                           connect_detail::channel_handle{process, ephemeral_mode,
-                                                          started_uri});
+  connect_detail::remember(
+      channel, connect_detail::channel_handle{startup.process, ephemeral_mode,
+                                              startup.target});
   return channel;
 }
 

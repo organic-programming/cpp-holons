@@ -1,5 +1,6 @@
 #include "../include/holons/describe.hpp"
 #include "../include/holons/holons.hpp"
+#include "../include/holons/serve.hpp"
 
 namespace {
 
@@ -749,6 +750,7 @@ struct connect_fixture {
   std::string slug;
   std::filesystem::path pid_file;
   std::filesystem::path args_file;
+  std::filesystem::path fd_mode_file;
   std::filesystem::path binary_path;
 };
 
@@ -758,6 +760,7 @@ connect_fixture write_connect_fixture(const std::string &given_name,
   auto slug = connect_slug(given_name, family_name);
   auto pid_file = root / (slug + ".pid");
   auto args_file = root / (slug + ".args");
+  auto fd_mode_file = root / (slug + ".fdmode");
   auto binary_path = root / (slug + "-server.sh");
   auto sdk_root = std::filesystem::path(find_sdk_dir()) / "cpp-holons";
   auto echo_server = sdk_root / "bin" / "echo-server";
@@ -770,6 +773,12 @@ connect_fixture write_connect_fixture(const std::string &given_name,
            << "echo $$ > " << pid_file << "\n"
            << ": > " << args_file << "\n"
            << "for arg in \"$@\"; do echo \"$arg\" >> " << args_file << "; done\n"
+           << "python3 - <<'PY' > " << fd_mode_file << "\n"
+           << "import os\n"
+           << "a = os.fstat(0)\n"
+           << "b = os.fstat(1)\n"
+           << "print('same' if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) else 'different')\n"
+           << "PY\n"
            << "exec " << echo_server << " \"$@\"\n";
   }
   assert(::chmod(binary_path.c_str(), 0700) == 0);
@@ -790,7 +799,8 @@ connect_fixture write_connect_fixture(const std::string &given_name,
              << "  binary: " << binary_path << "\n";
   }
 
-  return connect_fixture{root, slug, pid_file, args_file, binary_path};
+  return connect_fixture{root, slug, pid_file, args_file, fd_mode_file,
+                         binary_path};
 }
 
 void write_port_file(const std::filesystem::path &path, const std::string &uri) {
@@ -1721,6 +1731,14 @@ int main() {
   ++passed;
   assert(holons::parse_flags({}) == "tcp://:9090");
   ++passed;
+  auto serve_listeners = holons::serve::parse_flags(
+      {"--listen", "tcp://:8080", "--listen", "unix:///tmp/holons.sock"});
+  assert(serve_listeners.size() == 2);
+  ++passed;
+  assert(serve_listeners[0] == "tcp://:8080");
+  ++passed;
+  assert(serve_listeners[1] == "unix:///tmp/holons.sock");
+  ++passed;
 
   // --- yaml_value ---
   assert(holons::yaml_value("uuid: \"abc-123\"") == "abc-123");
@@ -1970,6 +1988,9 @@ int main() {
 
       assert(holons::trim_copy(read_file_text(fixture.args_file.string())) ==
              "serve\n--listen\nstdio://");
+      ++passed;
+      assert(holons::trim_copy(read_file_text(fixture.fd_mode_file.string())) ==
+             "same");
       ++passed;
 
       holons::disconnect(channel);
