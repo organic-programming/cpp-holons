@@ -3,6 +3,7 @@
 #include "describe.hpp"
 #include "holons.hpp"
 
+#include <array>
 #include <csignal>
 
 #if HOLONS_HAS_GRPCPP && __has_include(<grpcpp/ext/proto_server_reflection_plugin.h>)
@@ -72,8 +73,11 @@ public:
 
 #if HOLONS_HAS_GRPCPP
   server_handle(std::unique_ptr<grpc::Server> server,
-                std::vector<bound_listener> listeners)
-      : server_(std::move(server)), listeners_(std::move(listeners)) {}
+                std::vector<bound_listener> listeners,
+                std::vector<std::shared_ptr<void>> owned_objects = {})
+      : server_(std::move(server)),
+        listeners_(std::move(listeners)),
+        owned_objects_(std::move(owned_objects)) {}
 #endif
 
   server_handle(server_handle &&) noexcept = default;
@@ -123,6 +127,9 @@ private:
   std::unique_ptr<grpc::Server> server_;
 #endif
   std::vector<bound_listener> listeners_;
+#if HOLONS_HAS_GRPCPP
+  std::vector<std::shared_ptr<void>> owned_objects_;
+#endif
 };
 
 namespace detail {
@@ -167,6 +174,98 @@ struct pending_listener {
   std::shared_ptr<int> selected_port;
   bool attach_stdio = false;
 };
+
+#ifndef _WIN32
+class stdio_bridge {
+public:
+  explicit stdio_bridge(int port) : port_(port) {
+    input_fd_ = ::dup(STDIN_FILENO);
+    if (input_fd_ < 0) {
+      throw std::runtime_error("dup(STDIN_FILENO) failed for stdio:// serve");
+    }
+
+    output_fd_ = ::dup(STDOUT_FILENO);
+    if (output_fd_ < 0) {
+      close_fd(input_fd_, false);
+      input_fd_ = -1;
+      throw std::runtime_error("dup(STDOUT_FILENO) failed for stdio:// serve");
+    }
+  }
+
+  ~stdio_bridge() { stop(); }
+
+  void start() {
+    socket_fd_ = connect_loopback();
+    upstream_thread_ = std::thread([this]() {
+      connect_detail::relay_fd(input_fd_, socket_fd_);
+      if (socket_fd_ >= 0) {
+        ::shutdown(socket_fd_, SHUT_WR);
+      }
+    });
+    downstream_thread_ = std::thread([this]() {
+      connect_detail::relay_fd(socket_fd_, output_fd_);
+    });
+  }
+
+  void stop() {
+    if (stopped_) {
+      return;
+    }
+    stopped_ = true;
+
+    if (socket_fd_ >= 0) {
+      ::shutdown(socket_fd_, SHUT_RDWR);
+      close_fd(socket_fd_, true);
+      socket_fd_ = -1;
+    }
+    if (input_fd_ >= 0) {
+      close_fd(input_fd_, false);
+      input_fd_ = -1;
+    }
+    if (output_fd_ >= 0) {
+      close_fd(output_fd_, false);
+      output_fd_ = -1;
+    }
+
+    connect_detail::join_thread(&upstream_thread_);
+    connect_detail::join_thread(&downstream_thread_);
+  }
+
+private:
+  int connect_loopback() const {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      throw std::runtime_error("socket() failed for stdio:// serve bridge: " +
+                               std::string(std::strerror(errno)));
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port_));
+    if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+      close_fd(fd, true);
+      throw std::runtime_error("inet_pton() failed for stdio:// serve bridge");
+    }
+
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      auto message = last_socket_error();
+      close_fd(fd, true);
+      throw std::runtime_error("connect(loopback) failed for stdio:// serve bridge: " +
+                               message);
+    }
+
+    return fd;
+  }
+
+  int port_ = 0;
+  int input_fd_ = -1;
+  int output_fd_ = -1;
+  int socket_fd_ = -1;
+  bool stopped_ = false;
+  std::thread upstream_thread_;
+  std::thread downstream_thread_;
+};
+#endif
 
 inline std::string grpc_listen_target(const parsed_uri &parsed) {
   if (parsed.scheme == "tcp") {
@@ -360,6 +459,9 @@ inline server_handle start(const std::vector<std::string> &listen_uris,
     if (parsed.scheme == "stdio") {
       ++stdio_listeners;
       item.attach_stdio = true;
+      builder.AddListeningPort("127.0.0.1:0",
+                               grpc::InsecureServerCredentials(),
+                               item.selected_port.get());
       pending.push_back(std::move(item));
       continue;
     }
@@ -371,9 +473,12 @@ inline server_handle start(const std::vector<std::string> &listen_uris,
     throw std::invalid_argument("serve() supports at most one stdio:// listener");
   }
 
+  std::vector<std::shared_ptr<void>> owned_objects;
   auto holon_meta_service = detail::maybe_make_holon_meta_service(opts);
   if (holon_meta_service) {
-    builder.RegisterService(holon_meta_service.get());
+    auto owned = std::shared_ptr<grpc::Service>(std::move(holon_meta_service));
+    builder.RegisterService(owned.get());
+    owned_objects.push_back(std::move(owned));
   }
   if (register_services) {
     register_services(builder);
@@ -388,17 +493,19 @@ inline server_handle start(const std::vector<std::string> &listen_uris,
     if (!item.attach_stdio) {
       continue;
     }
-#if HOLONS_HAS_GRPC_FD
-    int fd = ::dup(STDIN_FILENO);
-    if (fd < 0) {
-      server->Shutdown();
-      throw std::runtime_error("dup(STDIN_FILENO) failed for stdio:// serve");
-    }
-    grpc::AddInsecureChannelFromFd(server.get(), fd);
-#else
+#ifdef _WIN32
     server->Shutdown();
     throw std::runtime_error(
-        "stdio:// serve requires grpc++ POSIX file-descriptor support");
+        "stdio:// serve is not supported on Windows in cpp-holons");
+#else
+    auto port = item.selected_port ? *item.selected_port : 0;
+    if (port <= 0) {
+      server->Shutdown();
+      throw std::runtime_error("stdio:// serve bridge did not get a loopback port");
+    }
+    auto bridge = std::make_shared<detail::stdio_bridge>(port);
+    bridge->start();
+    owned_objects.push_back(std::move(bridge));
 #endif
   }
 
@@ -413,7 +520,8 @@ inline server_handle start(const std::vector<std::string> &listen_uris,
     }
   }
 
-  return server_handle(std::move(server), std::move(bound));
+  return server_handle(std::move(server), std::move(bound),
+                       std::move(owned_objects));
 #endif
 }
 
