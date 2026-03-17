@@ -374,14 +374,13 @@ inline void fill_service_doc(const describe::service_doc &source,
 
 class holon_meta_service final : public holonmeta::v1::HolonMeta::Service {
 public:
-  holon_meta_service(std::filesystem::path proto_dir,
-                     std::filesystem::path holon_yaml)
-      : proto_dir_(std::move(proto_dir)), holon_yaml_(std::move(holon_yaml)) {}
+  explicit holon_meta_service(std::filesystem::path proto_dir)
+      : proto_dir_(std::move(proto_dir)) {}
 
   grpc::Status Describe(grpc::ServerContext *,
                         const holonmeta::v1::DescribeRequest *,
                         holonmeta::v1::DescribeResponse *response) override {
-    auto doc = describe::build_response(proto_dir_, holon_yaml_);
+    auto doc = describe::build_response(proto_dir_);
     response->set_slug(doc.slug);
     response->set_motto(doc.motto);
     for (const auto &service : doc.services) {
@@ -392,10 +391,9 @@ public:
 
 private:
   std::filesystem::path proto_dir_;
-  std::filesystem::path holon_yaml_;
 };
 
-inline std::unique_ptr<holon_meta_service> maybe_make_holon_meta_service(
+inline std::shared_ptr<grpc::Service> maybe_make_holon_meta_service(
     const options &opts) {
   if (!opts.auto_register_holon_meta) {
     return nullptr;
@@ -403,19 +401,19 @@ inline std::unique_ptr<holon_meta_service> maybe_make_holon_meta_service(
 
   auto cwd = std::filesystem::current_path();
   auto proto_dir = cwd / "protos";
-  auto holon_yaml = cwd / "holon.yaml";
-  std::error_code ec;
-  if (!std::filesystem::exists(proto_dir, ec) ||
-      !std::filesystem::is_directory(proto_dir, ec) ||
-      !std::filesystem::exists(holon_yaml, ec) ||
-      !std::filesystem::is_regular_file(holon_yaml, ec)) {
-    return nullptr;
+  try {
+    (void)resolve_manifest_path(proto_dir);
+  } catch (const std::runtime_error &error) {
+    if (std::string(error.what()).rfind("no holon.proto found near ", 0) == 0) {
+      return nullptr;
+    }
+    throw;
   }
 
-  return std::make_unique<holon_meta_service>(proto_dir, holon_yaml);
+  return std::make_shared<holon_meta_service>(proto_dir);
 }
 #else
-inline std::unique_ptr<grpc::Service> maybe_make_holon_meta_service(
+inline std::shared_ptr<grpc::Service> maybe_make_holon_meta_service(
     const options &) {
   return nullptr;
 }
@@ -476,9 +474,8 @@ inline server_handle start(const std::vector<std::string> &listen_uris,
   std::vector<std::shared_ptr<void>> owned_objects;
   auto holon_meta_service = detail::maybe_make_holon_meta_service(opts);
   if (holon_meta_service) {
-    auto owned = std::shared_ptr<grpc::Service>(std::move(holon_meta_service));
-    builder.RegisterService(owned.get());
-    owned_objects.push_back(std::move(owned));
+    builder.RegisterService(holon_meta_service.get());
+    owned_objects.push_back(holon_meta_service);
   }
   if (register_services) {
     register_services(builder);

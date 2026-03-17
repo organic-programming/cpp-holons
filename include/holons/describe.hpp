@@ -680,9 +680,8 @@ inline service_doc to_service_doc(const service_def &service,
 
 } // namespace detail
 
-inline describe_response build_response(const std::filesystem::path &proto_dir,
-                                        const std::filesystem::path &holon_yaml) {
-  auto identity = parse_holon(holon_yaml.string());
+inline describe_response build_response(const std::filesystem::path &proto_dir) {
+  auto identity = parse_holon(resolve_manifest_path(proto_dir).string());
   auto index = detail::parse_proto_directory(proto_dir);
 
   describe_response response;
@@ -699,13 +698,12 @@ inline describe_response build_response(const std::filesystem::path &proto_dir,
   return response;
 }
 
-inline registration make_registration(const std::filesystem::path &proto_dir,
-                                      const std::filesystem::path &holon_yaml) {
+inline registration make_registration(const std::filesystem::path &proto_dir) {
   registration reg;
   reg.service_name = std::string(kHolonMetaServiceName);
   reg.method_name = std::string(kDescribeMethodName);
-  reg.handler = [proto_dir, holon_yaml](const describe_request &) {
-    return build_response(proto_dir, holon_yaml);
+  reg.handler = [proto_dir](const describe_request &) {
+    return build_response(proto_dir);
   };
   return reg;
 }

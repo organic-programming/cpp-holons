@@ -18,31 +18,44 @@ void write_discovery_holon(const std::filesystem::path &dir,
                            const std::string &family_name,
                            const std::string &binary) {
   std::filesystem::create_directories(dir);
-  std::ofstream out(dir / "holon.yaml");
-  out << "schema: holon/v0\n"
-      << "uuid: \"" << uuid << "\"\n"
-      << "given_name: \"" << given_name << "\"\n"
-      << "family_name: \"" << family_name << "\"\n"
-      << "motto: \"Test\"\n"
-      << "composer: \"test\"\n"
-      << "clade: deterministic/pure\n"
-      << "status: draft\n"
-      << "born: \"2026-03-07\"\n"
-      << "kind: native\n"
-      << "build:\n"
-      << "  runner: go-module\n"
-      << "artifacts:\n"
-      << "  binary: " << binary << "\n";
+  std::ofstream out(dir / "holon.proto");
+  out << "syntax = \"proto3\";\n"
+      << "package holons.test.v1;\n\n"
+      << "option (holons.v1.manifest) = {\n"
+      << "  identity: {\n"
+      << "    uuid: \"" << uuid << "\"\n"
+      << "    given_name: \"" << given_name << "\"\n"
+      << "    family_name: \"" << family_name << "\"\n"
+      << "    motto: \"Test\"\n"
+      << "    composer: \"test\"\n"
+      << "    clade: \"deterministic/pure\"\n"
+      << "    status: \"draft\"\n"
+      << "    born: \"2026-03-07\"\n"
+      << "  }\n"
+      << "  kind: \"native\"\n"
+      << "  build: {\n"
+      << "    runner: \"go-module\"\n"
+      << "  }\n"
+      << "  artifacts: {\n"
+      << "    binary: \"" << binary << "\"\n"
+      << "  }\n"
+      << "};\n";
 }
 
 void write_echo_holon(const std::filesystem::path &dir) {
   std::filesystem::create_directories(dir / "protos" / "echo" / "v1");
 
   {
-    std::ofstream holon(dir / "holon.yaml");
-    holon << "given_name: Echo\n"
-          << "family_name: Server\n"
-          << "motto: Reply precisely.\n";
+    std::ofstream holon(dir / "holon.proto");
+    holon << "syntax = \"proto3\";\n"
+          << "package holons.test.v1;\n\n"
+          << "option (holons.v1.manifest) = {\n"
+          << "  identity: {\n"
+          << "    given_name: \"Echo\"\n"
+          << "    family_name: \"Server\"\n"
+          << "    motto: \"Reply precisely.\"\n"
+          << "  }\n"
+          << "};\n";
   }
 
   {
@@ -238,11 +251,19 @@ int main() {
   ++passed;
 
   auto temp_path = std::filesystem::temp_directory_path() /
-                   "holons_cpp_windows_test_holon.yaml";
+                   "holons_cpp_windows_test_holon.proto";
   {
     std::ofstream f(temp_path);
-    f << "uuid: \"abc-123\"\ngiven_name: \"test\"\n"
-      << "family_name: \"Test\"\nlang: \"cpp\"\n";
+    f << "syntax = \"proto3\";\n"
+      << "package test.v1;\n\n"
+      << "option (holons.v1.manifest) = {\n"
+      << "  identity: {\n"
+      << "    uuid: \"abc-123\"\n"
+      << "    given_name: \"test\"\n"
+      << "    family_name: \"Test\"\n"
+      << "  }\n"
+      << "  lang: \"cpp\"\n"
+      << "};\n";
   }
   auto id = holons::parse_holon(temp_path.string());
   assert(id.uuid == "abc-123");
@@ -254,8 +275,7 @@ int main() {
   auto describe_root = make_temp_dir("holons_cpp_describe_windows_");
   write_echo_holon(describe_root);
 
-  auto response = holons::describe::build_response(
-      describe_root / "protos", describe_root / "holon.yaml");
+  auto response = holons::describe::build_response(describe_root / "protos");
   assert(response.slug == "echo-server");
   ++passed;
   assert(response.motto == "Reply precisely.");
@@ -284,8 +304,8 @@ int main() {
   assert(response.services[0].methods[0].input_fields[0].example == "\"hello\"");
   ++passed;
 
-  auto registration = holons::describe::make_registration(
-      describe_root / "protos", describe_root / "holon.yaml");
+  auto registration =
+      holons::describe::make_registration(describe_root / "protos");
   assert(registration.service_name == "holonmeta.v1.HolonMeta");
   ++passed;
   assert(registration.method_name == "Describe");
@@ -297,13 +317,19 @@ int main() {
 
   auto empty_root = make_temp_dir("holons_cpp_describe_empty_windows_");
   {
-    std::ofstream holon(empty_root / "holon.yaml");
-    holon << "given_name: Empty\n"
-          << "family_name: Holon\n"
-          << "motto: Still available.\n";
+    std::ofstream holon(empty_root / "holon.proto");
+    holon << "syntax = \"proto3\";\n"
+          << "package holons.test.v1;\n\n"
+          << "option (holons.v1.manifest) = {\n"
+          << "  identity: {\n"
+          << "    given_name: \"Empty\"\n"
+          << "    family_name: \"Holon\"\n"
+          << "    motto: \"Still available.\"\n"
+          << "  }\n"
+          << "};\n";
   }
-  auto empty_response = holons::describe::build_response(
-      empty_root / "protos", empty_root / "holon.yaml");
+  auto empty_response =
+      holons::describe::build_response(empty_root / "protos");
   assert(empty_response.slug == "empty-holon");
   ++passed;
   assert(empty_response.services.empty());
@@ -384,12 +410,12 @@ int connect_tcp(const std::string &host, int port) {
   return fd;
 }
 
-std::string make_temp_yaml_path() {
+std::string make_temp_proto_path() {
   char tmpl[] = "/tmp/holons_cpp_test_XXXXXX";
   int fd = ::mkstemp(tmpl);
   assert(fd >= 0);
   ::close(fd);
-  std::string path = std::string(tmpl) + ".yaml";
+  std::string path = std::string(tmpl) + ".proto";
   std::remove(tmpl);
   return path;
 }
@@ -693,6 +719,14 @@ bool pid_exists(pid_t pid) {
   if (pid <= 0) {
     return false;
   }
+  int status = 0;
+  auto waited = ::waitpid(pid, &status, WNOHANG);
+  if (waited == pid) {
+    return false;
+  }
+  if (waited < 0 && errno != ECHILD) {
+    return false;
+  }
   return ::kill(pid, 0) == 0 || errno == EPERM;
 }
 
@@ -773,12 +807,11 @@ connect_fixture write_connect_fixture(const std::string &given_name,
            << "echo $$ > " << pid_file << "\n"
            << ": > " << args_file << "\n"
            << "for arg in \"$@\"; do echo \"$arg\" >> " << args_file << "; done\n"
-           << "python3 - <<'PY' > " << fd_mode_file << "\n"
-           << "import os\n"
-           << "a = os.fstat(0)\n"
-           << "b = os.fstat(1)\n"
-           << "print('same' if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) else 'different')\n"
-           << "PY\n"
+           << "python3 -c 'import os, pathlib; "
+           << "a = os.fstat(0); "
+           << "b = os.fstat(1); "
+           << "pathlib.Path(r\"" << fd_mode_file.string() << "\").write_text("
+           << "\"same\" if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) else \"different\")'\n"
            << "exec " << echo_server << " \"$@\"\n";
   }
   assert(::chmod(binary_path.c_str(), 0700) == 0);
@@ -786,17 +819,25 @@ connect_fixture write_connect_fixture(const std::string &given_name,
   auto holon_dir = root / "holons" / slug;
   std::filesystem::create_directories(holon_dir);
   {
-    std::ofstream manifest(holon_dir / "holon.yaml");
+    std::ofstream manifest(holon_dir / "holon.proto");
     assert(manifest.is_open());
-    manifest << "uuid: \"" << slug << "-uuid\"\n"
-             << "given_name: \"" << given_name << "\"\n"
-             << "family_name: \"" << family_name << "\"\n"
-             << "composer: \"connect-test\"\n"
-             << "kind: service\n"
-             << "build:\n"
-             << "  runner: shell\n"
-             << "artifacts:\n"
-             << "  binary: " << binary_path << "\n";
+    manifest << "syntax = \"proto3\";\n"
+             << "package holons.test.v1;\n\n"
+             << "option (holons.v1.manifest) = {\n"
+             << "  identity: {\n"
+             << "    uuid: \"" << slug << "-uuid\"\n"
+             << "    given_name: \"" << given_name << "\"\n"
+             << "    family_name: \"" << family_name << "\"\n"
+             << "    composer: \"connect-test\"\n"
+             << "  }\n"
+             << "  kind: \"service\"\n"
+             << "  build: {\n"
+             << "    runner: \"shell\"\n"
+             << "  }\n"
+             << "  artifacts: {\n"
+             << "    binary: \"" << binary_path.string() << "\"\n"
+             << "  }\n"
+             << "};\n";
   }
 
   return connect_fixture{root, slug, pid_file, args_file, fd_mode_file,
@@ -1740,19 +1781,27 @@ int main() {
   assert(serve_listeners[1] == "unix:///tmp/holons.sock");
   ++passed;
 
-  // --- yaml_value ---
-  assert(holons::yaml_value("uuid: \"abc-123\"") == "abc-123");
+  // --- proto_field_value ---
+  assert(holons::proto_field_value("uuid: \"abc-123\"", "uuid") == "abc-123");
   ++passed;
-  assert(holons::yaml_value("lang: rust") == "rust");
+  assert(holons::proto_field_value("lang: rust", "lang") == "rust");
   ++passed;
 
   // --- parse_holon ---
   {
-    std::string path = make_temp_yaml_path();
+    std::string path = make_temp_proto_path();
     {
       std::ofstream f(path);
-      f << "uuid: \"abc-123\"\ngiven_name: \"test\"\n"
-        << "family_name: \"Test\"\nlang: \"cpp\"\n";
+      f << "syntax = \"proto3\";\n"
+        << "package test.v1;\n\n"
+        << "option (holons.v1.manifest) = {\n"
+        << "  identity: {\n"
+        << "    uuid: \"abc-123\"\n"
+        << "    given_name: \"test\"\n"
+        << "    family_name: \"Test\"\n"
+        << "  }\n"
+        << "  lang: \"cpp\"\n"
+        << "};\n";
     }
     auto id = holons::parse_holon(path);
     assert(id.uuid == "abc-123");
@@ -1769,8 +1818,7 @@ int main() {
     auto root = make_temp_dir("holons_cpp_describe_");
     write_echo_holon(root);
 
-    auto response = holons::describe::build_response(root / "protos",
-                                                     root / "holon.yaml");
+    auto response = holons::describe::build_response(root / "protos");
     assert(response.slug == "echo-server");
     ++passed;
     assert(response.motto == "Reply precisely.");
@@ -1816,8 +1864,8 @@ int main() {
     assert(method.input_fields[0].example == "\"hello\"");
     ++passed;
 
-    auto registration = holons::describe::make_registration(
-        root / "protos", root / "holon.yaml");
+    auto registration =
+        holons::describe::make_registration(root / "protos");
     assert(registration.service_name == "holonmeta.v1.HolonMeta");
     ++passed;
     assert(registration.method_name == "Describe");
@@ -1836,14 +1884,19 @@ int main() {
   {
     auto root = make_temp_dir("holons_cpp_describe_empty_");
     {
-      std::ofstream holon(root / "holon.yaml");
-      holon << "given_name: Empty\n"
-            << "family_name: Holon\n"
-            << "motto: Still available.\n";
+      std::ofstream holon(root / "holon.proto");
+      holon << "syntax = \"proto3\";\n"
+            << "package holons.test.v1;\n\n"
+            << "option (holons.v1.manifest) = {\n"
+            << "  identity: {\n"
+            << "    given_name: \"Empty\"\n"
+            << "    family_name: \"Holon\"\n"
+            << "    motto: \"Still available.\"\n"
+            << "  }\n"
+            << "};\n";
     }
 
-    auto response = holons::describe::build_response(root / "protos",
-                                                     root / "holon.yaml");
+    auto response = holons::describe::build_response(root / "protos");
     assert(response.slug == "empty-holon");
     ++passed;
     assert(response.motto == "Still available.");
@@ -1856,16 +1909,16 @@ int main() {
 
   // --- parse_holon invalid mapping ---
   {
-    std::string path = make_temp_yaml_path();
+    std::string path = make_temp_proto_path();
     {
       std::ofstream f(path);
-      f << "- not\n- a\n- mapping\n";
+      f << "syntax = \"proto3\";\npackage test.v1;\n";
     }
     try {
       holons::parse_holon(path);
       assert(false && "should have thrown");
     } catch (const std::runtime_error &e) {
-      assert(std::string(e.what()).find("mapping") != std::string::npos);
+      assert(std::string(e.what()).find("manifest option") != std::string::npos);
       ++passed;
     }
     std::remove(path.c_str());

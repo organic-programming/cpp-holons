@@ -34,7 +34,7 @@ The bundled codegen step emits `*.pb.*` and `*.grpc.pb.*` into `build/generated/
 | `holons::accept(listener)` | Accept one runtime connection |
 | `holons::mem_dial(listener)` | Dial the client side of a `mem://` listener |
 | `holons::parse_flags(args)` | CLI arg extraction |
-| `holons::parse_holon(path)` | `holon.yaml` parser |
+| `holons::parse_holon(path)` | `holon.proto` parser |
 | `holons::discover(root)` | Discover holons under a root |
 | `holons::discover_local()` | Discover from the current working directory |
 | `holons::discover_all()` | Discover from local, `$OPBIN`, and cache roots |

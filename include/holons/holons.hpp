@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <regex>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1456,13 +1457,184 @@ inline std::string strip_quotes(std::string value) {
   return value;
 }
 
-/// Extract a YAML value from a simple key: "value" line.
-/// Handles both quoted and unquoted values.
-inline std::string yaml_value(const std::string &line) {
-  auto colon = line.find(':');
-  if (colon == std::string::npos)
-    return "";
-  return strip_quotes(trim_copy(line.substr(colon + 1)));
+inline std::string escape_regex(std::string value) {
+  static constexpr std::string_view special = R"(\.^$|()[]{}*+?)";
+  std::string escaped;
+  escaped.reserve(value.size() * 2);
+  for (char ch : value) {
+    if (special.find(ch) != std::string_view::npos) {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(ch);
+  }
+  return escaped;
+}
+
+inline std::string unescape_proto_string(std::string value) {
+  std::string out;
+  out.reserve(value.size());
+  bool escaped = false;
+  for (char ch : value) {
+    if (escaped) {
+      out.push_back(ch);
+      escaped = false;
+      continue;
+    }
+    if (ch == '\\') {
+      escaped = true;
+      continue;
+    }
+    out.push_back(ch);
+  }
+  if (escaped) {
+    out.push_back('\\');
+  }
+  return out;
+}
+
+inline std::optional<std::string> balanced_block_contents(
+    const std::string &source, size_t opening_brace) {
+  int depth = 0;
+  bool inside_string = false;
+  bool escaped = false;
+  const auto content_start = opening_brace + 1;
+
+  for (size_t index = opening_brace; index < source.size(); ++index) {
+    const char ch = source[index];
+    if (inside_string) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == '"') {
+        inside_string = false;
+      }
+      continue;
+    }
+
+    if (ch == '"') {
+      inside_string = true;
+    } else if (ch == '{') {
+      depth += 1;
+    } else if (ch == '}') {
+      depth -= 1;
+      if (depth == 0) {
+        return source.substr(content_start, index - content_start);
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+inline std::optional<std::string> extract_manifest_block(
+    const std::string &source) {
+  static const std::regex re(
+      R"(option\s*\(\s*holons\.v1\.manifest\s*\)\s*=\s*\{)");
+  std::smatch match;
+  if (!std::regex_search(source, match, re)) {
+    return std::nullopt;
+  }
+  auto brace = source.find('{', static_cast<size_t>(match.position()));
+  if (brace == std::string::npos) {
+    return std::nullopt;
+  }
+  return balanced_block_contents(source, brace);
+}
+
+inline std::optional<std::string> extract_proto_block(
+    const std::string &name, const std::string &source) {
+  const std::regex re("\\b" + escape_regex(name) + R"(\s*:\s*\{)");
+  std::smatch match;
+  if (!std::regex_search(source, match, re)) {
+    return std::nullopt;
+  }
+  auto brace = source.find('{', static_cast<size_t>(match.position()));
+  if (brace == std::string::npos) {
+    return std::nullopt;
+  }
+  return balanced_block_contents(source, brace);
+}
+
+inline std::string proto_field_value(const std::string &source,
+                                     const std::string &name) {
+  const std::regex quoted_re("\\b" + escape_regex(name) +
+                             R"re(\s*:\s*"((?:[^"\\]|\\.)*)")re");
+  std::smatch quoted_match;
+  if (std::regex_search(source, quoted_match, quoted_re)) {
+    return unescape_proto_string(quoted_match[1].str());
+  }
+
+  const std::regex bare_re("\\b" + escape_regex(name) +
+                           R"(\s*:\s*([^\s,\]\}]+))");
+  std::smatch bare_match;
+  if (std::regex_search(source, bare_match, bare_re)) {
+    return bare_match[1].str();
+  }
+  return "";
+}
+
+struct ResolvedHolonManifest {
+  HolonIdentity identity;
+  HolonManifest manifest;
+};
+
+inline ResolvedHolonManifest parse_resolved_manifest(
+    const std::string &path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    throw std::runtime_error("cannot open: " + path);
+  }
+
+  const std::string text((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+  auto manifest_block = extract_manifest_block(text);
+  if (!manifest_block.has_value()) {
+    throw std::runtime_error(path +
+                             ": missing holons.v1.manifest option in holon.proto");
+  }
+
+  const auto identity_block =
+      extract_proto_block("identity", *manifest_block).value_or("");
+  const auto build_block =
+      extract_proto_block("build", *manifest_block).value_or("");
+  const auto artifacts_block =
+      extract_proto_block("artifacts", *manifest_block).value_or("");
+
+  ResolvedHolonManifest resolved;
+  resolved.identity.uuid = proto_field_value(identity_block, "uuid");
+  resolved.identity.given_name = proto_field_value(identity_block, "given_name");
+  resolved.identity.family_name =
+      proto_field_value(identity_block, "family_name");
+  resolved.identity.motto = proto_field_value(identity_block, "motto");
+  resolved.identity.composer = proto_field_value(identity_block, "composer");
+  resolved.identity.clade = proto_field_value(identity_block, "clade");
+  resolved.identity.status = proto_field_value(identity_block, "status");
+  resolved.identity.born = proto_field_value(identity_block, "born");
+  resolved.identity.lang = proto_field_value(*manifest_block, "lang");
+
+  resolved.manifest.kind = proto_field_value(*manifest_block, "kind");
+  resolved.manifest.build.runner = proto_field_value(build_block, "runner");
+  if (resolved.manifest.build.runner.empty()) {
+    resolved.manifest.build.runner = proto_field_value(*manifest_block, "runner");
+  }
+  resolved.manifest.build.main = proto_field_value(build_block, "main");
+  if (resolved.manifest.build.main.empty()) {
+    resolved.manifest.build.main = proto_field_value(*manifest_block, "main");
+  }
+  resolved.manifest.artifacts.binary =
+      proto_field_value(artifacts_block, "binary");
+  if (resolved.manifest.artifacts.binary.empty()) {
+    resolved.manifest.artifacts.binary =
+        proto_field_value(*manifest_block, "binary");
+  }
+  resolved.manifest.artifacts.primary =
+      proto_field_value(artifacts_block, "primary");
+  if (resolved.manifest.artifacts.primary.empty()) {
+    resolved.manifest.artifacts.primary =
+        proto_field_value(*manifest_block, "primary");
+  }
+  return resolved;
 }
 
 inline std::string slug_from_identity(const HolonIdentity &id) {
@@ -1496,120 +1668,12 @@ inline std::string slug_from_identity(const HolonIdentity &id) {
 }
 
 inline std::optional<HolonManifest> parse_manifest(const std::string &path) {
-  std::ifstream file(path);
-  if (!file.is_open()) {
-    throw std::runtime_error("cannot open: " + path);
-  }
-
-  HolonManifest manifest;
-  bool saw_mapping = false;
-  bool saw_manifest_value = false;
-  std::string section;
-  std::string line;
-
-  while (std::getline(file, line)) {
-    auto indent = line.find_first_not_of(" \t");
-    if (indent == std::string::npos) {
-      continue;
-    }
-
-    std::string trimmed = trim_copy(line);
-    if (trimmed.empty() || trimmed.front() == '#') {
-      continue;
-    }
-
-    auto colon = trimmed.find(':');
-    if (colon == std::string::npos) {
-      continue;
-    }
-
-    saw_mapping = true;
-    std::string key = trimmed.substr(0, colon);
-    std::string value = yaml_value(trimmed);
-
-    if (indent == 0) {
-      section.clear();
-      if (key == "kind") {
-        manifest.kind = value;
-        saw_manifest_value = true;
-      } else if ((key == "build" || key == "artifacts") && value.empty()) {
-        section = key;
-      }
-      continue;
-    }
-
-    if (section == "build") {
-      if (key == "runner") {
-        manifest.build.runner = value;
-        saw_manifest_value = true;
-      } else if (key == "main") {
-        manifest.build.main = value;
-        saw_manifest_value = true;
-      }
-    } else if (section == "artifacts") {
-      if (key == "binary") {
-        manifest.artifacts.binary = value;
-        saw_manifest_value = true;
-      } else if (key == "primary") {
-        manifest.artifacts.primary = value;
-        saw_manifest_value = true;
-      }
-    }
-  }
-
-  if (!saw_mapping) {
-    throw std::runtime_error(path + ": holon.yaml must be a YAML mapping");
-  }
-  if (!saw_manifest_value) {
-    return std::nullopt;
-  }
-  return manifest;
+  return parse_resolved_manifest(path).manifest;
 }
 
-/// Parse a holon.yaml file.
+/// Parse a holon.proto file.
 inline HolonIdentity parse_holon(const std::string &path) {
-  std::ifstream file(path);
-  if (!file.is_open())
-    throw std::runtime_error("cannot open: " + path);
-
-  std::string text((std::istreambuf_iterator<char>(file)),
-                   std::istreambuf_iterator<char>());
-
-  HolonIdentity id;
-  bool saw_mapping = false;
-
-  // Simple line-by-line parsing
-  std::istringstream ss(text);
-  std::string line;
-  while (std::getline(ss, line)) {
-    std::string trimmed = trim_copy(line);
-    if (trimmed.empty() || trimmed.front() == '#') {
-      continue;
-    }
-    if (trimmed.find(':') != std::string::npos)
-      saw_mapping = true;
-    if (trimmed.find("uuid:") == 0)
-      id.uuid = yaml_value(trimmed);
-    else if (trimmed.find("given_name:") == 0)
-      id.given_name = yaml_value(trimmed);
-    else if (trimmed.find("family_name:") == 0)
-      id.family_name = yaml_value(trimmed);
-    else if (trimmed.find("motto:") == 0)
-      id.motto = yaml_value(trimmed);
-    else if (trimmed.find("composer:") == 0)
-      id.composer = yaml_value(trimmed);
-    else if (trimmed.find("clade:") == 0)
-      id.clade = yaml_value(trimmed);
-    else if (trimmed.find("status:") == 0)
-      id.status = yaml_value(trimmed);
-    else if (trimmed.find("born:") == 0)
-      id.born = yaml_value(trimmed);
-    else if (trimmed.find("lang:") == 0)
-      id.lang = yaml_value(trimmed);
-  }
-  if (!saw_mapping)
-    throw std::runtime_error(path + ": holon.yaml must be a YAML mapping");
-  return id;
+  return parse_resolved_manifest(path).identity;
 }
 
 inline std::filesystem::path discover_resolve_root(const std::filesystem::path &root) {
@@ -1621,6 +1685,100 @@ inline std::filesystem::path discover_resolve_root(const std::filesystem::path &
   }
   auto canonical = std::filesystem::weakly_canonical(absolute, ec);
   return ec ? absolute : canonical;
+}
+
+inline std::optional<std::filesystem::path> find_holon_proto(
+    const std::filesystem::path &root) {
+  std::error_code ec;
+  auto resolved = discover_resolve_root(root);
+  if (std::filesystem::is_regular_file(resolved, ec)) {
+    ec.clear();
+    return resolved.filename() == "holon.proto"
+               ? std::optional<std::filesystem::path>(resolved)
+               : std::nullopt;
+  }
+  ec.clear();
+  if (!std::filesystem::exists(resolved, ec) ||
+      !std::filesystem::is_directory(resolved, ec)) {
+    ec.clear();
+    return std::nullopt;
+  }
+
+  auto direct = resolved / "holon.proto";
+  if (std::filesystem::is_regular_file(direct, ec)) {
+    ec.clear();
+    return direct;
+  }
+  ec.clear();
+
+  auto api_v1 = resolved / "api" / "v1" / "holon.proto";
+  if (std::filesystem::is_regular_file(api_v1, ec)) {
+    ec.clear();
+    return api_v1;
+  }
+  ec.clear();
+
+  std::vector<std::filesystem::path> candidates;
+  std::filesystem::recursive_directory_iterator it(
+      resolved, std::filesystem::directory_options::skip_permission_denied, ec);
+  std::filesystem::recursive_directory_iterator end;
+  for (; it != end; it.increment(ec)) {
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+    const auto &path = it->path();
+    if (!it->is_regular_file(ec)) {
+      ec.clear();
+      continue;
+    }
+    if (path.filename() == "holon.proto") {
+      candidates.push_back(path);
+    }
+  }
+  if (candidates.empty()) {
+    return std::nullopt;
+  }
+  std::sort(candidates.begin(), candidates.end());
+  return candidates.front();
+}
+
+inline std::filesystem::path resolve_manifest_path(
+    const std::filesystem::path &root) {
+  auto resolved = discover_resolve_root(root);
+  std::vector<std::filesystem::path> search_roots{resolved};
+  if (resolved.filename() == "protos" && resolved.has_parent_path()) {
+    search_roots.push_back(resolved.parent_path());
+  } else if (resolved.has_parent_path()) {
+    search_roots.push_back(resolved.parent_path());
+  }
+
+  for (const auto &candidate_root : search_roots) {
+    if (auto candidate = find_holon_proto(candidate_root); candidate.has_value()) {
+      return *candidate;
+    }
+  }
+
+  throw std::runtime_error("no holon.proto found near " +
+                           resolved.generic_string());
+}
+
+inline std::filesystem::path manifest_root(
+    const std::filesystem::path &manifest_path) {
+  auto manifest_dir = manifest_path.parent_path();
+  if (manifest_dir.empty()) {
+    return ".";
+  }
+  static const std::regex version_re(R"(^v[0-9]+(?:[A-Za-z0-9._-]*)?$)");
+  const auto version_dir = manifest_dir.filename().string();
+  const auto api_dir = manifest_dir.parent_path().filename().string();
+  if (std::regex_match(version_dir, version_re) && api_dir == "api") {
+    auto holon_root = manifest_dir.parent_path().parent_path();
+    if (!holon_root.empty()) {
+      return holon_root;
+    }
+  }
+  return manifest_dir;
 }
 
 inline bool should_skip_discovery_dir(const std::string &name) {
@@ -1662,7 +1820,7 @@ inline HolonEntry parse_holon_entry(const std::filesystem::path &manifest_path,
   entry.identity = parse_holon(manifest_path.string());
   entry.slug = slug_from_identity(entry.identity);
   entry.uuid = entry.identity.uuid;
-  entry.dir = discover_resolve_root(manifest_path.parent_path());
+  entry.dir = discover_resolve_root(manifest_root(manifest_path));
   entry.relative_path = entry.dir.lexically_relative(root);
   if (entry.relative_path.empty()) {
     entry.relative_path = ".";
@@ -1705,7 +1863,7 @@ inline std::vector<HolonEntry> discover_with_origin(
       continue;
     }
 
-    if (ec || !it->is_regular_file(ec) || path.filename() != "holon.yaml") {
+    if (ec || !it->is_regular_file(ec) || path.filename() != "holon.proto") {
       ec.clear();
       continue;
     }
@@ -1911,7 +2069,8 @@ inline std::shared_ptr<grpc::Channel> dial_ready(const std::string &target,
   (void)timeout_ms;
   throw std::runtime_error("grpc++ headers are required for connect()");
 #else
-  auto channel = grpc::CreateChannel(normalize_dial_target(target),
+  auto normalized = normalize_dial_target(target);
+  auto channel = grpc::CreateChannel(normalized,
                                      grpc::InsecureChannelCredentials());
   if (!channel) {
     throw std::runtime_error("grpc::CreateChannel returned null");
@@ -1919,7 +2078,8 @@ inline std::shared_ptr<grpc::Channel> dial_ready(const std::string &target,
   auto deadline = std::chrono::system_clock::now() +
                   std::chrono::milliseconds(std::max(timeout_ms, 1));
   if (!channel->WaitForConnected(deadline)) {
-    throw std::runtime_error("timed out waiting for gRPC readiness");
+    throw std::runtime_error("timed out waiting for gRPC readiness: " +
+                             normalized);
   }
   return channel;
 #endif
@@ -1935,7 +2095,7 @@ inline std::shared_ptr<grpc::Channel> dial_ready_from_fd(int fd, int timeout_ms)
   auto deadline = std::chrono::system_clock::now() +
                   std::chrono::milliseconds(std::max(timeout_ms, 1));
   if (!channel->WaitForConnected(deadline)) {
-    throw std::runtime_error("timed out waiting for gRPC readiness");
+    throw std::runtime_error("timed out waiting for gRPC readiness: stdio://");
   }
   return channel;
 #else
@@ -2363,15 +2523,28 @@ inline std::string resolve_binary_path(const HolonEntry &entry) {
   }
 
   auto name = trim_copy(entry.manifest->artifacts.binary);
-  if (name.empty()) {
-    throw std::runtime_error("holon \"" + entry.slug + "\" has no artifacts.binary");
-  }
-
   auto is_file = [](const std::filesystem::path &path) {
     std::error_code ec;
     return std::filesystem::exists(path, ec) &&
            std::filesystem::is_regular_file(path, ec);
   };
+
+  if (name.empty()) {
+    auto bin_dir = entry.dir / ".op" / "build" / "bin";
+    std::error_code ec;
+    if (std::filesystem::exists(bin_dir, ec) &&
+        std::filesystem::is_directory(bin_dir, ec)) {
+      for (const auto &candidate : std::filesystem::directory_iterator(bin_dir, ec)) {
+        if (ec) {
+          break;
+        }
+        if (candidate.is_regular_file(ec)) {
+          return candidate.path().string();
+        }
+      }
+    }
+    throw std::runtime_error("holon \"" + entry.slug + "\" has no artifacts.binary");
+  }
 
   std::filesystem::path direct(name);
   if (direct.is_absolute() && is_file(direct)) {
@@ -2707,15 +2880,29 @@ inline std::string resolve_binary_path(const HolonEntry &entry) {
   }
 
   auto name = trim_copy(entry.manifest->artifacts.binary);
-  if (name.empty()) {
-    throw std::runtime_error("holon \"" + entry.slug + "\" has no artifacts.binary");
-  }
-
   auto is_file = [](const std::filesystem::path &path) {
     std::error_code ec;
     return std::filesystem::exists(path, ec) &&
            std::filesystem::is_regular_file(path, ec);
   };
+
+  if (name.empty()) {
+    auto bin_dir = entry.dir / ".op" / "build" / "bin";
+    std::error_code ec;
+    if (std::filesystem::exists(bin_dir, ec) &&
+        std::filesystem::is_directory(bin_dir, ec)) {
+      for (const auto &candidate : std::filesystem::directory_iterator(bin_dir, ec)) {
+        if (ec) {
+          break;
+        }
+        if (candidate.is_regular_file(ec) &&
+            ::access(candidate.path().c_str(), X_OK) == 0) {
+          return candidate.path().string();
+        }
+      }
+    }
+    throw std::runtime_error("holon \"" + entry.slug + "\" has no artifacts.binary");
+  }
 
   std::filesystem::path direct(name);
   if (direct.is_absolute() && is_file(direct) && ::access(direct.c_str(), X_OK) == 0) {
@@ -2764,13 +2951,15 @@ inline void close_process_io(const std::shared_ptr<process_handle> &process) {
       process->client_fd = -1;
     }
   }
-  if (process->stdin_fd >= 0) {
-    close_fd(process->stdin_fd, false);
-    process->stdin_fd = -1;
+  int stdin_fd = process->stdin_fd;
+  int stdout_fd = process->stdout_fd;
+  process->stdin_fd = -1;
+  process->stdout_fd = -1;
+  if (stdin_fd >= 0) {
+    close_fd(stdin_fd, false);
   }
-  if (process->stdout_fd >= 0) {
-    close_fd(process->stdout_fd, false);
-    process->stdout_fd = -1;
+  if (stdout_fd >= 0 && stdout_fd != stdin_fd) {
+    close_fd(stdout_fd, false);
   }
   if (process->stderr_fd >= 0) {
     close_fd(process->stderr_fd, false);
@@ -3035,6 +3224,8 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
 #if HOLONS_HAS_GRPC_FD
   int transport_pair[2] = {-1, -1};
   int stderr_pipe[2] = {-1, -1};
+  int listener_fd = -1;
+  std::string proxy_uri;
 #ifdef _WIN32
   if (win_socketpair(transport_pair) != 0 || ::pipe(stderr_pipe) != 0) {
 #else
@@ -3052,12 +3243,40 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
     throw std::runtime_error("stdio transport setup failed");
   }
 
-  auto pid = ::fork();
-  if (pid < 0) {
-    close_fd(transport_pair[0], true);
-    close_fd(transport_pair[1], true);
+  try {
+    listener_fd = create_loopback_listener(&proxy_uri);
+  } catch (const std::exception &) {
     close_pipe_fd(&stderr_pipe[0]);
     close_pipe_fd(&stderr_pipe[1]);
+    if (transport_pair[0] >= 0) {
+      close_fd(transport_pair[0], true);
+    }
+    if (transport_pair[1] >= 0) {
+      close_fd(transport_pair[1], true);
+    }
+    throw;
+  }
+
+  auto cleanup_fds = [&]() {
+    close_pipe_fd(&stderr_pipe[0]);
+    close_pipe_fd(&stderr_pipe[1]);
+    if (transport_pair[0] >= 0) {
+      close_fd(transport_pair[0], true);
+      transport_pair[0] = -1;
+    }
+    if (transport_pair[1] >= 0) {
+      close_fd(transport_pair[1], true);
+      transport_pair[1] = -1;
+    }
+    if (listener_fd >= 0) {
+      close_fd(listener_fd, true);
+      listener_fd = -1;
+    }
+  };
+
+  auto pid = ::fork();
+  if (pid < 0) {
+    cleanup_fds();
     throw std::runtime_error("fork() failed");
   }
 
@@ -3065,10 +3284,7 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
     ::dup2(transport_pair[1], STDIN_FILENO);
     ::dup2(transport_pair[1], STDOUT_FILENO);
     ::dup2(stderr_pipe[1], STDERR_FILENO);
-    close_fd(transport_pair[0], true);
-    close_fd(transport_pair[1], true);
-    close_pipe_fd(&stderr_pipe[0]);
-    close_pipe_fd(&stderr_pipe[1]);
+    cleanup_fds();
 
     std::array<char *, 5> argv{
         const_cast<char *>(binary_path.c_str()), const_cast<char *>("serve"),
@@ -3084,7 +3300,10 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
 
   auto process = std::make_shared<process_handle>();
   process->pid = pid;
+  process->stdin_fd = transport_pair[0];
+  process->stdout_fd = transport_pair[0];
   process->stderr_fd = stderr_pipe[0];
+  process->listener_fd = listener_fd;
   process->stderr_thread = std::thread([process]() {
     std::array<char, 4096> buffer{};
     for (;;) {
@@ -3103,6 +3322,31 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
     }
   });
 
+  process->accept_thread = std::thread([process]() {
+    int accepted = ::accept(process->listener_fd, nullptr, nullptr);
+    if (accepted < 0) {
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(process->client_mutex);
+      if (process->closed) {
+        close_fd(accepted, true);
+        return;
+      }
+      process->client_fd = accepted;
+    }
+
+    std::thread upstream([process, accepted]() {
+      relay_fd(accepted, process->stdin_fd);
+    });
+    std::thread downstream([process, accepted]() {
+      relay_fd(process->stdout_fd, accepted);
+    });
+    join_thread(&upstream);
+    join_thread(&downstream);
+  });
+
   auto startup_deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(
                               std::max(1, std::min(timeout_ms, 200)));
@@ -3113,7 +3357,7 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
       process->pid = -1;
       auto message = stderr_text(process);
       close_process_io(process);
-      close_fd(transport_pair[0], true);
+      join_thread(&process->accept_thread);
       join_thread(&process->stderr_thread);
       throw std::runtime_error("holon exited before stdio startup" +
                                (message.empty() ? std::string()
@@ -3122,7 +3366,7 @@ inline startup_result start_stdio_holon(const std::string &binary_path,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
-  return startup_result{"stdio://", transport_pair[0], process};
+  return startup_result{proxy_uri, -1, process};
 #else
   int stdin_pipe[2] = {-1, -1};
   int stdout_pipe[2] = {-1, -1};
@@ -3284,10 +3528,15 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
   const bool ephemeral_mode = ephemeral || requested_transport == "stdio";
 
   if (connect_detail::is_direct_target(trimmed)) {
-    auto channel = connect_detail::dial_ready(trimmed, opts.timeout_ms);
-    connect_detail::remember(
-        channel, connect_detail::channel_handle{nullptr, false, trimmed});
-    return channel;
+    try {
+      auto channel = connect_detail::dial_ready(trimmed, opts.timeout_ms);
+      connect_detail::remember(
+          channel, connect_detail::channel_handle{nullptr, false, trimmed});
+      return channel;
+    } catch (const std::exception &ex) {
+      throw std::runtime_error("connect(\"" + trimmed + "\") failed: " +
+                               ex.what());
+    }
   }
 
   auto entry = find_by_slug(trimmed);
@@ -3301,10 +3550,15 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
   if (auto existing =
           connect_detail::usable_port_file(port_file, opts.timeout_ms);
       existing.has_value()) {
-    auto channel = connect_detail::dial_ready(*existing, opts.timeout_ms);
-    connect_detail::remember(
-        channel, connect_detail::channel_handle{nullptr, false, *existing});
-    return channel;
+    try {
+      auto channel = connect_detail::dial_ready(*existing, opts.timeout_ms);
+      connect_detail::remember(
+          channel, connect_detail::channel_handle{nullptr, false, *existing});
+      return channel;
+    } catch (const std::exception &ex) {
+      throw std::runtime_error("connect(\"" + trimmed +
+                               "\") failed via port file: " + ex.what());
+    }
   }
 
   if (!opts.start) {
@@ -3327,9 +3581,10 @@ connect_with_mode(const std::string &target, const ConnectOptions &input_opts,
     if (!ephemeral_mode && requested_transport == "tcp") {
       connect_detail::write_port_file(port_file, startup.target);
     }
-  } catch (const std::exception &) {
+  } catch (const std::exception &ex) {
     connect_detail::stop_process(startup.process);
-    throw;
+    throw std::runtime_error("connect(\"" + trimmed +
+                             "\") failed after startup: " + ex.what());
   }
   connect_detail::remember(
       channel, connect_detail::channel_handle{startup.process, ephemeral_mode,
