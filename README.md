@@ -32,7 +32,6 @@ The bundled codegen step emits `*.pb.*` and `*.grpc.pb.*` into `build/generated/
 | `holons::parse_uri(uri)` | Parse transport URI into normalized fields |
 | `holons::listen(uri)` | Create a listener variant |
 | `holons::accept(listener)` | Accept one runtime connection |
-| `holons::mem_dial(listener)` | Dial the client side of a `mem://` listener |
 | `holons::parse_flags(args)` | CLI arg extraction |
 | `holons::parse_holon(path)` | `holon.proto` parser |
 | `holons::discover(root)` | Discover holons under a root |
@@ -50,7 +49,7 @@ The bundled codegen step emits `*.pb.*` and `*.grpc.pb.*` into `build/generated/
 
 ## Current scope
 
-- Runtime transports: `tcp://`, `unix://`, `stdio://`, `mem://`
+- Runtime transports: `tcp://`, `unix://`, `stdio://`
 - `ws://` and `wss://` are metadata-only at the transport layer
 - Discovery scans local, `$OPBIN`, and cache roots
 - `connect()` supports direct targets and slug-based startup on POSIX and Windows
