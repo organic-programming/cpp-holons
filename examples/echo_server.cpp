@@ -25,10 +25,12 @@ int main(int argc, char **argv) {
     args.erase(args.begin());
   }
 
-  auto listeners = holons::serve::parse_flags(args);
+  auto parsed = holons::serve::parse_options(args);
+  holons::serve::options opts;
+  opts.enable_reflection = parsed.reflect;
   EchoServiceImpl service;
-  holons::serve::serve(listeners, [&service](grpc::ServerBuilder &builder) {
-    builder.RegisterService(&service);
-  });
+  holons::serve::serve(
+      parsed.listeners,
+      [&service](grpc::ServerBuilder &builder) { builder.RegisterService(&service); }, opts);
   return 0;
 }

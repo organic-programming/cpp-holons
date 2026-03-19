@@ -1780,6 +1780,9 @@ int main() {
   ++passed;
   assert(serve_listeners[1] == "unix:///tmp/holons.sock");
   ++passed;
+  auto serve_options = holons::serve::parse_options({"--reflect"});
+  assert(serve_options.reflect);
+  ++passed;
 
   // --- proto_field_value ---
   assert(holons::proto_field_value("uuid: \"abc-123\"", "uuid") == "abc-123");

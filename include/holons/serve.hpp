@@ -31,10 +31,15 @@
 namespace holons::serve {
 
 struct options {
-  bool enable_reflection = true;
+  bool enable_reflection = false;
   bool auto_register_holon_meta = true;
   bool announce = true;
   int graceful_shutdown_timeout_ms = 10000;
+};
+
+struct parsed_flags {
+  std::vector<std::string> listeners;
+  bool reflect = false;
 };
 
 struct bound_listener {
@@ -44,23 +49,31 @@ struct bound_listener {
 
 using register_fn = std::function<void(grpc::ServerBuilder &)>;
 
-inline std::vector<std::string> parse_flags(const std::vector<std::string> &args) {
-  std::vector<std::string> listeners;
+inline parsed_flags parse_options(const std::vector<std::string> &args) {
+  parsed_flags parsed;
   for (size_t i = 0; i < args.size(); ++i) {
     if (args[i] == "--listen" && i + 1 < args.size()) {
-      listeners.push_back(args[i + 1]);
+      parsed.listeners.push_back(args[i + 1]);
       ++i;
       continue;
     }
     if (args[i] == "--port" && i + 1 < args.size()) {
-      listeners.push_back("tcp://:" + args[i + 1]);
+      parsed.listeners.push_back("tcp://:" + args[i + 1]);
       ++i;
+      continue;
+    }
+    if (args[i] == "--reflect") {
+      parsed.reflect = true;
     }
   }
-  if (listeners.empty()) {
-    listeners.push_back(std::string(kDefaultURI));
+  if (parsed.listeners.empty()) {
+    parsed.listeners.push_back(std::string(kDefaultURI));
   }
-  return listeners;
+  return parsed;
+}
+
+inline std::vector<std::string> parse_flags(const std::vector<std::string> &args) {
+  return parse_options(args).listeners;
 }
 
 inline std::string parse_flag(const std::vector<std::string> &args) {
