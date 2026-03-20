@@ -8,6 +8,7 @@ include(CMakeParseArguments)
 
 add_library(holons INTERFACE)
 target_include_directories(holons INTERFACE include)
+target_include_directories(holons INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/gen/cpp")
 target_include_directories(holons INTERFACE /opt/homebrew/include /usr/local/include)
 
 add_executable(test_runner test/holons_test.cpp)
@@ -38,7 +39,8 @@ if (WIN32)
   target_link_libraries(test_runner PRIVATE ws2_32)
 endif()
 
-set(HOLONS_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/protos")
+set(HOLONS_CANONICAL_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../_protos")
+set(HOLONS_LOCAL_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/protos")
 set(HOLONS_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 if (TARGET protobuf::protoc)
@@ -110,9 +112,9 @@ function(holons_generate_grpc_cpp target_name)
         "${HG_OUT_DIR}/${proto_dir}/${proto_name}.grpc.pb.cc"
         "${HG_OUT_DIR}/${proto_dir}/${proto_name}.grpc.pb.h"
       COMMAND "${HOLONS_PROTOC_EXECUTABLE}"
-        --cpp_out="${HG_OUT_DIR}"
-        --grpc_out="${HG_OUT_DIR}"
-        --plugin=protoc-gen-grpc="${HOLONS_GRPC_CPP_PLUGIN}"
+        --cpp_out=${HG_OUT_DIR}
+        --grpc_out=${HG_OUT_DIR}
+        --plugin=protoc-gen-grpc=${HOLONS_GRPC_CPP_PLUGIN}
         ${import_args}
         "${proto}"
       DEPENDS "${proto}"
@@ -130,20 +132,35 @@ function(holons_generate_grpc_cpp target_name)
   endif()
 endfunction()
 
-holons_generate_grpc_cpp(holonmeta_grpc
+holons_generate_grpc_cpp(holons_proto_grpc
   OUT_DIR "${HOLONS_GENERATED_DIR}"
-  PROTOS "${HOLONS_PROTO_ROOT}/holonmeta/v1/holonmeta.proto"
-  IMPORT_DIRS "${HOLONS_PROTO_ROOT}"
+  PROTOS
+    "${HOLONS_CANONICAL_PROTO_ROOT}/holons/v1/manifest.proto"
+    "${HOLONS_CANONICAL_PROTO_ROOT}/holons/v1/describe.proto"
+    "${HOLONS_CANONICAL_PROTO_ROOT}/holons/v1/coax.proto"
+  IMPORT_DIRS "${HOLONS_CANONICAL_PROTO_ROOT}"
 )
 
 holons_generate_grpc_cpp(echo_grpc
   OUT_DIR "${HOLONS_GENERATED_DIR}"
-  PROTOS "${HOLONS_PROTO_ROOT}/echo/v1/echo.proto"
-  IMPORT_DIRS "${HOLONS_PROTO_ROOT}"
+  PROTOS "${HOLONS_LOCAL_PROTO_ROOT}/echo/v1/echo.proto"
+  IMPORT_DIRS "${HOLONS_LOCAL_PROTO_ROOT}"
 )
 
-if (TARGET holonmeta_grpc AND TARGET echo_grpc)
+if (TARGET holons_proto_grpc)
+  target_link_libraries(test_runner PRIVATE holons_proto_grpc)
+endif()
+
+if (TARGET holons_proto_grpc AND TARGET echo_grpc)
   add_executable(cpp_echo_server examples/echo_server.cpp)
-  target_link_libraries(cpp_echo_server PRIVATE holons holonmeta_grpc echo_grpc)
+  target_link_libraries(cpp_echo_server PRIVATE holons holons_proto_grpc echo_grpc)
   target_include_directories(cpp_echo_server PRIVATE "${HOLONS_GENERATED_DIR}")
+  if (TARGET gRPC::grpc++_reflection)
+    target_link_libraries(cpp_echo_server PRIVATE gRPC::grpc++_reflection)
+  else()
+    find_library(GRPCPP_REFLECTION_LIBRARY NAMES grpc++_reflection PATHS /opt/homebrew/lib /usr/local/lib)
+    if (GRPCPP_REFLECTION_LIBRARY)
+      target_link_libraries(cpp_echo_server PRIVATE "${GRPCPP_REFLECTION_LIBRARY}")
+    endif()
+  endif()
 endif()

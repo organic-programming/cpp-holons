@@ -20,9 +20,10 @@
 #define HOLONS_HAS_GRPC_HEALTH 0
 #endif
 
-#if HOLONS_HAS_GRPCPP && __has_include("holonmeta/v1/holonmeta.pb.h") &&         \
-    __has_include("holonmeta/v1/holonmeta.grpc.pb.h")
-#include "holonmeta/v1/holonmeta.grpc.pb.h"
+#if HOLONS_HAS_GRPCPP && __has_include("holons/v1/describe.pb.h") &&         \
+    __has_include("holons/v1/describe.grpc.pb.h")
+#include "holons/v1/describe.grpc.pb.h"
+#include "holons/v1/manifest.pb.h"
 #define HOLONS_HAS_HOLONMETA_GRPC 1
 #else
 #define HOLONS_HAS_HOLONMETA_GRPC 0
@@ -333,20 +334,20 @@ inline void maybe_enable_health_check() {
 
 #if HOLONS_HAS_HOLONMETA_GRPC
 inline void fill_enum_value_doc(const describe::enum_value_doc &source,
-                                holonmeta::v1::EnumValueDoc *target) {
+                                holons::v1::EnumValueDoc *target) {
   target->set_name(source.name);
   target->set_number(source.number);
   target->set_description(source.description);
 }
 
 inline void fill_field_doc(const describe::field_doc &source,
-                           holonmeta::v1::FieldDoc *target) {
+                           holons::v1::FieldDoc *target) {
   target->set_name(source.name);
   target->set_type(source.type);
   target->set_number(source.number);
   target->set_description(source.description);
   target->set_label(
-      static_cast<holonmeta::v1::FieldLabel>(static_cast<int>(source.label)));
+      static_cast<holons::v1::FieldLabel>(static_cast<int>(source.label)));
   target->set_map_key_type(source.map_key_type);
   target->set_map_value_type(source.map_value_type);
   target->set_required(source.required);
@@ -360,7 +361,7 @@ inline void fill_field_doc(const describe::field_doc &source,
 }
 
 inline void fill_method_doc(const describe::method_doc &source,
-                            holonmeta::v1::MethodDoc *target) {
+                            holons::v1::MethodDoc *target) {
   target->set_name(source.name);
   target->set_description(source.description);
   target->set_input_type(source.input_type);
@@ -377,7 +378,7 @@ inline void fill_method_doc(const describe::method_doc &source,
 }
 
 inline void fill_service_doc(const describe::service_doc &source,
-                             holonmeta::v1::ServiceDoc *target) {
+                             holons::v1::ServiceDoc *target) {
   target->set_name(source.name);
   target->set_description(source.description);
   for (const auto &method : source.methods) {
@@ -385,17 +386,39 @@ inline void fill_service_doc(const describe::service_doc &source,
   }
 }
 
-class holon_meta_service final : public holonmeta::v1::HolonMeta::Service {
+inline void fill_manifest_identity(const HolonIdentity &source,
+                                   holons::v1::HolonManifest_Identity *target) {
+  target->set_schema("holon/v1");
+  target->set_uuid(source.uuid);
+  target->set_given_name(source.given_name);
+  target->set_family_name(source.family_name);
+  target->set_motto(source.motto);
+  target->set_composer(source.composer);
+  target->set_status(source.status);
+  target->set_born(source.born);
+}
+
+inline void fill_manifest(const HolonManifest &source,
+                          holons::v1::HolonManifest *target) {
+  fill_manifest_identity(source.identity, target->mutable_identity());
+  target->set_lang(source.lang);
+  target->set_kind(source.kind);
+  target->mutable_build()->set_runner(source.build.runner);
+  target->mutable_build()->set_main(source.build.main);
+  target->mutable_artifacts()->set_binary(source.artifacts.binary);
+  target->mutable_artifacts()->set_primary(source.artifacts.primary);
+}
+
+class holon_meta_service final : public holons::v1::HolonMeta::Service {
 public:
   explicit holon_meta_service(std::filesystem::path proto_dir)
       : proto_dir_(std::move(proto_dir)) {}
 
   grpc::Status Describe(grpc::ServerContext *,
-                        const holonmeta::v1::DescribeRequest *,
-                        holonmeta::v1::DescribeResponse *response) override {
+                        const holons::v1::DescribeRequest *,
+                        holons::v1::DescribeResponse *response) override {
     auto doc = describe::build_response(proto_dir_);
-    response->set_slug(doc.slug);
-    response->set_motto(doc.motto);
+    fill_manifest(doc.manifest, response->mutable_manifest());
     for (const auto &service : doc.services) {
       fill_service_doc(service, response->add_services());
     }

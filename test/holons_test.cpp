@@ -276,9 +276,11 @@ int main() {
   write_echo_holon(describe_root);
 
   auto response = holons::describe::build_response(describe_root / "protos");
-  assert(response.slug == "echo-server");
+  assert(response.manifest.identity.given_name == "Echo");
   ++passed;
-  assert(response.motto == "Reply precisely.");
+  assert(response.manifest.identity.family_name == "Server");
+  ++passed;
+  assert(response.manifest.identity.motto == "Reply precisely.");
   ++passed;
   assert(response.services.size() == 1);
   ++passed;
@@ -306,12 +308,14 @@ int main() {
 
   auto registration =
       holons::describe::make_registration(describe_root / "protos");
-  assert(registration.service_name == "holonmeta.v1.HolonMeta");
+  assert(registration.service_name == "holons.v1.HolonMeta");
   ++passed;
   assert(registration.method_name == "Describe");
   ++passed;
   auto registered =
       registration.handler(holons::describe::describe_request{});
+  assert(registered.manifest.identity.given_name == "Echo");
+  ++passed;
   assert(registered.services.size() == 1);
   ++passed;
 
@@ -330,7 +334,11 @@ int main() {
   }
   auto empty_response =
       holons::describe::build_response(empty_root / "protos");
-  assert(empty_response.slug == "empty-holon");
+  assert(empty_response.manifest.identity.given_name == "Empty");
+  ++passed;
+  assert(empty_response.manifest.identity.family_name == "Holon");
+  ++passed;
+  assert(empty_response.manifest.identity.motto == "Still available.");
   ++passed;
   assert(empty_response.services.empty());
   ++passed;
@@ -1822,9 +1830,11 @@ int main() {
     write_echo_holon(root);
 
     auto response = holons::describe::build_response(root / "protos");
-    assert(response.slug == "echo-server");
+    assert(response.manifest.identity.given_name == "Echo");
     ++passed;
-    assert(response.motto == "Reply precisely.");
+    assert(response.manifest.identity.family_name == "Server");
+    ++passed;
+    assert(response.manifest.identity.motto == "Reply precisely.");
     ++passed;
     assert(response.services.size() == 1);
     ++passed;
@@ -1869,13 +1879,13 @@ int main() {
 
     auto registration =
         holons::describe::make_registration(root / "protos");
-    assert(registration.service_name == "holonmeta.v1.HolonMeta");
+    assert(registration.service_name == "holons.v1.HolonMeta");
     ++passed;
     assert(registration.method_name == "Describe");
     ++passed;
     auto registered =
         registration.handler(holons::describe::describe_request{});
-    assert(registered.slug == "echo-server");
+    assert(registered.manifest.identity.given_name == "Echo");
     ++passed;
     assert(registered.services.size() == 1);
     ++passed;
@@ -1900,9 +1910,11 @@ int main() {
     }
 
     auto response = holons::describe::build_response(root / "protos");
-    assert(response.slug == "empty-holon");
+    assert(response.manifest.identity.given_name == "Empty");
     ++passed;
-    assert(response.motto == "Still available.");
+    assert(response.manifest.identity.family_name == "Holon");
+    ++passed;
+    assert(response.manifest.identity.motto == "Still available.");
     ++passed;
     assert(response.services.empty());
     ++passed;

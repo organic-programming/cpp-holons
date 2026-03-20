@@ -10,7 +10,7 @@
 
 namespace holons::describe {
 
-constexpr std::string_view kHolonMetaServiceName = "holonmeta.v1.HolonMeta";
+constexpr std::string_view kHolonMetaServiceName = "holons.v1.HolonMeta";
 constexpr std::string_view kDescribeMethodName = "Describe";
 
 enum class field_label {
@@ -62,8 +62,7 @@ struct service_doc {
 struct describe_request {};
 
 struct describe_response {
-  std::string slug;
-  std::string motto;
+  HolonManifest manifest;
   std::vector<service_doc> services;
 };
 
@@ -681,12 +680,11 @@ inline service_doc to_service_doc(const service_def &service,
 } // namespace detail
 
 inline describe_response build_response(const std::filesystem::path &proto_dir) {
-  auto identity = parse_holon(resolve_manifest_path(proto_dir).string());
+  auto resolved = parse_resolved_manifest(resolve_manifest_path(proto_dir).string());
   auto index = detail::parse_proto_directory(proto_dir);
 
   describe_response response;
-  response.slug = detail::slug_for(identity);
-  response.motto = identity.motto;
+  response.manifest = resolved.manifest;
 
   for (const auto &service : index.services) {
     if (service.full_name == kHolonMetaServiceName) {

@@ -1424,6 +1424,8 @@ struct HolonArtifacts {
 };
 
 struct HolonManifest {
+  HolonIdentity identity;
+  std::string lang;
   std::string kind;
   HolonBuild build;
   HolonArtifacts artifacts;
@@ -1613,6 +1615,8 @@ inline ResolvedHolonManifest parse_resolved_manifest(
   resolved.identity.born = proto_field_value(identity_block, "born");
   resolved.identity.lang = proto_field_value(*manifest_block, "lang");
 
+  resolved.manifest.identity = resolved.identity;
+  resolved.manifest.lang = resolved.identity.lang;
   resolved.manifest.kind = proto_field_value(*manifest_block, "kind");
   resolved.manifest.build.runner = proto_field_value(build_block, "runner");
   if (resolved.manifest.build.runner.empty()) {
