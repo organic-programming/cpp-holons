@@ -144,6 +144,13 @@ inline std::shared_ptr<ServerCredentials> InsecureServerCredentials() {
 }
 } // namespace grpc
 #endif
+#if __has_include(<openssl/err.h>) && __has_include(<openssl/ssl.h>)
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#define HOLONS_HAS_OPENSSL 1
+#else
+#define HOLONS_HAS_OPENSSL 0
+#endif
 #if HOLONS_HAS_GRPCPP && !defined(_WIN32) &&                                   \
     __has_include(<grpcpp/create_channel_posix.h>) &&                          \
     __has_include(<grpcpp/server_posix.h>)
@@ -186,6 +193,13 @@ inline void ensure_winsock() {
 }
 } // namespace detail
 #endif
+
+inline void ensure_sigpipe_ignored() {
+#ifndef _WIN32
+  static std::once_flag once;
+  std::call_once(once, []() { ::signal(SIGPIPE, SIG_IGN); });
+#endif
+}
 
 inline int close_fd(int fd, bool is_socket) {
 #ifdef _WIN32
@@ -311,6 +325,7 @@ struct parsed_uri {
   std::string host;
   int port = 0;
   std::string path;
+  std::string query;
   bool secure = false;
 };
 
@@ -381,7 +396,7 @@ inline parsed_uri parse_uri(const std::string &uri) {
     if (uri.rfind("tcp://", 0) != 0)
       throw std::invalid_argument("invalid tcp URI: " + uri);
     auto [host, port] = split_host_port(uri.substr(6), 9090);
-    return {uri, "tcp", host, port, "", false};
+    return {uri, "tcp", host, port, "", "", false};
   }
 
   if (s == "unix") {
@@ -390,17 +405,17 @@ inline parsed_uri parse_uri(const std::string &uri) {
     auto path = uri.substr(7);
     if (path.empty())
       throw std::invalid_argument("invalid unix URI: " + uri);
-    return {uri, "unix", "", 0, path, false};
+    return {uri, "unix", "", 0, path, "", false};
   }
 
   if (s == "stdio") {
-    return {"stdio://", "stdio", "", 0, "", false};
+    return {"stdio://", "stdio", "", 0, "", "", false};
   }
 
   if (s == "mem") {
     std::string raw = uri.rfind("mem://", 0) == 0 ? uri : "mem://";
     std::string name = raw.size() > 6 ? raw.substr(6) : "";
-    return {raw, "mem", "", 0, name, false};
+    return {raw, "mem", "", 0, name, "", false};
   }
 
   if (s == "ws" || s == "wss") {
@@ -415,12 +430,122 @@ inline parsed_uri parse_uri(const std::string &uri) {
     std::string path = slash == std::string::npos ? "/grpc" : trimmed.substr(slash);
     if (path.empty())
       path = "/grpc";
+    std::string query;
+    auto query_pos = path.find('?');
+    if (query_pos != std::string::npos) {
+      query = path.substr(query_pos + 1);
+      path = path.substr(0, query_pos);
+      if (path.empty()) {
+        path = "/grpc";
+      }
+    }
 
     auto [host, port] = split_host_port(addr, secure ? 443 : 80);
-    return {uri, s, host, port, path, secure};
+    return {uri, s, host, port, path, query, secure};
+  }
+
+  if (s == "http" || s == "https") {
+    bool secure = s == "https";
+    std::string prefix = secure ? "https://" : "http://";
+    if (uri.rfind(prefix, 0) != 0)
+      throw std::invalid_argument("invalid http URI: " + uri);
+
+    std::string trimmed = uri.substr(prefix.size());
+    auto slash = trimmed.find('/');
+    std::string addr = slash == std::string::npos ? trimmed : trimmed.substr(0, slash);
+    std::string path = slash == std::string::npos ? "/api/v1/rpc"
+                                                  : trimmed.substr(slash);
+    if (path.empty())
+      path = "/api/v1/rpc";
+    std::string query;
+    auto query_pos = path.find('?');
+    if (query_pos != std::string::npos) {
+      query = path.substr(query_pos + 1);
+      path = path.substr(0, query_pos);
+      if (path.empty()) {
+        path = "/api/v1/rpc";
+      }
+    }
+
+    auto [host, port] = split_host_port(addr, secure ? 443 : 80);
+    return {uri, s, host, port, path, query, secure};
   }
 
   throw std::invalid_argument("unsupported transport URI: " + uri);
+}
+
+inline int uri_hex_digit(char ch) {
+  if (ch >= '0' && ch <= '9')
+    return ch - '0';
+  if (ch >= 'a' && ch <= 'f')
+    return 10 + (ch - 'a');
+  if (ch >= 'A' && ch <= 'F')
+    return 10 + (ch - 'A');
+  return -1;
+}
+
+inline std::string uri_decode(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (size_t i = 0; i < value.size(); ++i) {
+    if (value[i] == '+' ) {
+      out.push_back(' ');
+      continue;
+    }
+    if (value[i] == '%' && i + 2 < value.size()) {
+      int hi = uri_hex_digit(value[i + 1]);
+      int lo = uri_hex_digit(value[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(value[i]);
+  }
+  return out;
+}
+
+inline std::string uri_encode(std::string_view value) {
+  static const char *hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(value.size() * 3);
+  for (unsigned char ch : value) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' ||
+        ch == '~') {
+      out.push_back(static_cast<char>(ch));
+      continue;
+    }
+    out.push_back('%');
+    out.push_back(hex[(ch >> 4) & 0x0F]);
+    out.push_back(hex[ch & 0x0F]);
+  }
+  return out;
+}
+
+inline std::unordered_map<std::string, std::string>
+parse_query_params(std::string_view query) {
+  std::unordered_map<std::string, std::string> params;
+  size_t start = 0;
+  while (start <= query.size()) {
+    auto amp = query.find('&', start);
+    auto end = amp == std::string_view::npos ? query.size() : amp;
+    auto piece = query.substr(start, end - start);
+    if (!piece.empty()) {
+      auto eq = piece.find('=');
+      auto key = uri_decode(piece.substr(0, eq));
+      auto value = eq == std::string_view::npos
+                       ? std::string()
+                       : uri_decode(piece.substr(eq + 1));
+      params[key] = value;
+    }
+    if (amp == std::string_view::npos) {
+      break;
+    }
+    start = amp + 1;
+  }
+  return params;
 }
 
 inline listener listen(const std::string &uri) {
@@ -586,6 +711,7 @@ inline ssize_t conn_read(const connection &conn, void *buf, size_t n) {
 }
 
 inline ssize_t conn_write(const connection &conn, const void *buf, size_t n) {
+  ensure_sigpipe_ignored();
   if (conn.scheme == "stdio") {
 #ifdef _WIN32
     return ::_write(conn.write_fd, buf, static_cast<unsigned int>(n));
@@ -806,6 +932,31 @@ private:
     json result = json::object();
   };
 
+#if HOLONS_HAS_OPENSSL
+  struct tls_state {
+    SSL_CTX *ctx = nullptr;
+    SSL *ssl = nullptr;
+
+    ~tls_state() {
+      if (ssl != nullptr) {
+        SSL_free(ssl);
+      }
+      if (ctx != nullptr) {
+        SSL_CTX_free(ctx);
+      }
+    }
+  };
+#endif
+
+  enum class transport_mode { websocket, http_sse };
+
+  struct transport_snapshot {
+    int fd = -1;
+#if HOLONS_HAS_OPENSSL
+    std::shared_ptr<tls_state> tls;
+#endif
+  };
+
   void io_loop() {
     while (running_.load()) {
       if (socket_fd() < 0) {
@@ -893,14 +1044,29 @@ private:
     return connected_;
   }
 
-  int socket_fd() const {
+  transport_snapshot current_transport() const {
     std::lock_guard<std::mutex> lock(state_mu_);
-    return sockfd_;
+    transport_snapshot snapshot;
+    snapshot.fd = sockfd_;
+#if HOLONS_HAS_OPENSSL
+    snapshot.tls = tls_state_;
+#endif
+    return snapshot;
   }
 
-  void set_socket_fd(int fd) {
+  int socket_fd() const { return current_transport().fd; }
+
+  void set_transport(int fd
+#if HOLONS_HAS_OPENSSL
+                     ,
+                     std::shared_ptr<tls_state> tls = nullptr
+#endif
+  ) {
     std::lock_guard<std::mutex> lock(state_mu_);
     sockfd_ = fd;
+#if HOLONS_HAS_OPENSSL
+    tls_state_ = std::move(tls);
+#endif
   }
 
   void close_socket() {
@@ -909,6 +1075,9 @@ private:
       close_fd(sockfd_, true);
       sockfd_ = -1;
     }
+#if HOLONS_HAS_OPENSSL
+    tls_state_.reset();
+#endif
   }
 
   void force_disconnect() {
@@ -933,13 +1102,33 @@ private:
     fail_all_pending(-32000, reason);
   }
 
-  static bool send_all(int fd, const void *data, size_t size) {
+  bool send_all(const void *data, size_t size) {
+    ensure_sigpipe_ignored();
+    auto transport = current_transport();
+    if (transport.fd < 0) {
+      return false;
+    }
+
     const auto *ptr = static_cast<const uint8_t *>(data);
     size_t sent = 0;
     while (sent < size) {
+#if HOLONS_HAS_OPENSSL
+      if (transport.tls && transport.tls->ssl != nullptr) {
+        int n = SSL_write(
+            transport.tls->ssl, ptr + sent,
+            static_cast<int>(std::min(
+                size - sent,
+                static_cast<size_t>(std::numeric_limits<int>::max()))));
+        if (n <= 0) {
+          return false;
+        }
+        sent += static_cast<size_t>(n);
+        continue;
+      }
+#endif
       size_t chunk = std::min(size - sent,
                               static_cast<size_t>(std::numeric_limits<int>::max()));
-      ssize_t n = ::send(fd, reinterpret_cast<const char *>(ptr + sent),
+      ssize_t n = ::send(transport.fd, reinterpret_cast<const char *>(ptr + sent),
                          static_cast<int>(chunk), 0);
       if (n <= 0) {
         return false;
@@ -949,13 +1138,32 @@ private:
     return true;
   }
 
-  static bool read_exact(int fd, void *data, size_t size) {
+  bool read_exact(void *data, size_t size) {
+    auto transport = current_transport();
+    if (transport.fd < 0) {
+      return false;
+    }
+
     auto *ptr = static_cast<uint8_t *>(data);
     size_t got = 0;
     while (got < size) {
+#if HOLONS_HAS_OPENSSL
+      if (transport.tls && transport.tls->ssl != nullptr) {
+        int n = SSL_read(
+            transport.tls->ssl, ptr + got,
+            static_cast<int>(std::min(
+                size - got,
+                static_cast<size_t>(std::numeric_limits<int>::max()))));
+        if (n <= 0) {
+          return false;
+        }
+        got += static_cast<size_t>(n);
+        continue;
+      }
+#endif
       size_t chunk = std::min(size - got,
                               static_cast<size_t>(std::numeric_limits<int>::max()));
-      ssize_t n = ::recv(fd, reinterpret_cast<char *>(ptr + got),
+      ssize_t n = ::recv(transport.fd, reinterpret_cast<char *>(ptr + got),
                          static_cast<int>(chunk), 0);
       if (n <= 0) {
         return false;
@@ -965,6 +1173,73 @@ private:
     return true;
   }
 
+#if HOLONS_HAS_OPENSSL
+  static void ensure_openssl_initialized() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+      OPENSSL_init_ssl(0, nullptr);
+      SSL_load_error_strings();
+    });
+  }
+
+  std::shared_ptr<tls_state> connect_tls(const parsed_uri &parsed, int fd) {
+    ensure_openssl_initialized();
+
+    auto params = parse_query_params(parsed.query);
+    bool insecure = false;
+    if (auto it = params.find("insecure"); it != params.end()) {
+      auto lowered = it->second;
+      std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                     [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                     });
+      insecure = lowered == "1" || lowered == "true" || lowered == "yes";
+    }
+
+    auto tls = std::make_shared<tls_state>();
+    tls->ctx = SSL_CTX_new(TLS_client_method());
+    if (tls->ctx == nullptr) {
+      throw std::runtime_error("failed to create TLS context");
+    }
+
+    if (insecure) {
+      SSL_CTX_set_verify(tls->ctx, SSL_VERIFY_NONE, nullptr);
+    } else {
+      SSL_CTX_set_verify(tls->ctx, SSL_VERIFY_PEER, nullptr);
+      (void)SSL_CTX_set_default_verify_paths(tls->ctx);
+      if (auto it = params.find("ca"); it != params.end() && !it->second.empty()) {
+        if (SSL_CTX_load_verify_locations(tls->ctx, it->second.c_str(),
+                                          nullptr) != 1) {
+          throw std::runtime_error("failed to load TLS CA file: " + it->second);
+        }
+      }
+    }
+
+    tls->ssl = SSL_new(tls->ctx);
+    if (tls->ssl == nullptr) {
+      throw std::runtime_error("failed to create TLS session");
+    }
+
+    if (!parsed.host.empty()) {
+      (void)SSL_set_tlsext_host_name(tls->ssl, parsed.host.c_str());
+    }
+
+    if (SSL_set_fd(tls->ssl, fd) != 1) {
+      throw std::runtime_error("failed to bind TLS session to socket");
+    }
+
+    if (SSL_connect(tls->ssl) != 1) {
+      throw std::runtime_error("TLS handshake failed");
+    }
+
+    if (!insecure && SSL_get_verify_result(tls->ssl) != X509_V_OK) {
+      throw std::runtime_error("TLS certificate verification failed");
+    }
+
+    return tls;
+  }
+#endif
+
   bool open_socket() {
 #ifdef _WIN32
     detail::ensure_winsock();
@@ -972,10 +1247,6 @@ private:
     auto parsed = parse_uri(endpoint_);
     if (parsed.scheme != "ws" && parsed.scheme != "wss") {
       throw std::runtime_error("holon-rpc requires ws:// or wss:// endpoint");
-    }
-    if (parsed.secure) {
-      throw std::runtime_error(
-          "wss:// is not supported in cpp-holons without TLS dependencies");
     }
 
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -996,6 +1267,31 @@ private:
       return false;
     }
 
+#if HOLONS_HAS_OPENSSL
+    std::shared_ptr<tls_state> tls;
+    if (parsed.secure) {
+      try {
+        tls = connect_tls(parsed, fd);
+      } catch (...) {
+        close_fd(fd, true);
+        throw;
+      }
+    }
+#else
+    if (parsed.secure) {
+      close_fd(fd, true);
+      throw std::runtime_error(
+          "wss:// requires OpenSSL support in cpp-holons");
+    }
+#endif
+
+    set_transport(fd
+#if HOLONS_HAS_OPENSSL
+                  ,
+                  tls
+#endif
+    );
+
     std::ostringstream req;
     req << "GET " << (parsed.path.empty() ? "/rpc" : parsed.path)
         << " HTTP/1.1\r\n";
@@ -1007,8 +1303,8 @@ private:
     req << "Sec-WebSocket-Protocol: holon-rpc\r\n\r\n";
 
     auto req_str = req.str();
-    if (!send_all(fd, req_str.data(), req_str.size())) {
-      close_fd(fd, true);
+    if (!send_all(req_str.data(), req_str.size())) {
+      close_socket();
       return false;
     }
 
@@ -1016,14 +1312,13 @@ private:
     headers.reserve(4096);
     char ch = 0;
     while (headers.find("\r\n\r\n") == std::string::npos) {
-      ssize_t n = ::recv(fd, &ch, 1, 0);
-      if (n <= 0) {
-        close_fd(fd, true);
+      if (!read_exact(&ch, 1)) {
+        close_socket();
         return false;
       }
       headers.push_back(ch);
       if (headers.size() > 16384) {
-        close_fd(fd, true);
+        close_socket();
         throw std::runtime_error("websocket handshake too large");
       }
     }
@@ -1035,12 +1330,11 @@ private:
     if (lower.find(" 101 ") == std::string::npos ||
         lower.find("sec-websocket-protocol: holon-rpc") ==
             std::string::npos) {
-      close_fd(fd, true);
+      close_socket();
       throw std::runtime_error(
           "server did not negotiate holon-rpc websocket protocol");
     }
 
-    set_socket_fd(fd);
     return true;
   }
 
@@ -1052,8 +1346,7 @@ private:
   }
 
   bool send_frame(uint8_t opcode, const std::string &payload) {
-    int fd = socket_fd();
-    if (fd < 0) {
+    if (socket_fd() < 0) {
       return false;
     }
 
@@ -1086,7 +1379,7 @@ private:
     }
 
     std::lock_guard<std::mutex> lock(send_mu_);
-    return send_all(fd, frame.data(), frame.size());
+    return send_all(frame.data(), frame.size());
   }
 
   bool read_text_frame(std::string &out) {
@@ -1095,13 +1388,12 @@ private:
     bool reading_fragment = false;
 
     while (running_.load()) {
-      int fd = socket_fd();
-      if (fd < 0) {
+      if (socket_fd() < 0) {
         return false;
       }
 
       uint8_t header[2];
-      if (!read_exact(fd, header, 2)) {
+      if (!read_exact(header, 2)) {
         return false;
       }
 
@@ -1112,13 +1404,13 @@ private:
 
       if (len == 126) {
         uint8_t ext[2];
-        if (!read_exact(fd, ext, 2)) {
+        if (!read_exact(ext, 2)) {
           return false;
         }
         len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
       } else if (len == 127) {
         uint8_t ext[8];
-        if (!read_exact(fd, ext, 8)) {
+        if (!read_exact(ext, 8)) {
           return false;
         }
         len = 0;
@@ -1129,13 +1421,13 @@ private:
 
       std::array<uint8_t, 4> mask{};
       if (masked) {
-        if (!read_exact(fd, mask.data(), mask.size())) {
+        if (!read_exact(mask.data(), mask.size())) {
           return false;
         }
       }
 
       std::string payload(len, '\0');
-      if (len > 0 && !read_exact(fd, payload.data(), len)) {
+      if (len > 0 && !read_exact(payload.data(), len)) {
         return false;
       }
       if (masked) {
@@ -1377,10 +1669,14 @@ private:
   mutable std::mutex state_mu_;
   mutable std::condition_variable connected_cv_;
   int sockfd_ = -1;
+#if HOLONS_HAS_OPENSSL
+  std::shared_ptr<tls_state> tls_state_;
+#endif
   bool connected_ = false;
   std::string last_error_;
 
   std::string endpoint_;
+  transport_mode transport_mode_ = transport_mode::websocket;
   std::atomic<bool> running_{false};
   std::atomic<bool> closed_{true};
   std::thread io_thread_;
@@ -1398,6 +1694,523 @@ private:
   std::unordered_map<std::string, std::shared_ptr<pending_call>> pending_;
 
   std::atomic<uint64_t> next_id_{0};
+};
+
+struct holon_rpc_sse_event {
+  nlohmann::json result = nlohmann::json::object();
+  nlohmann::json error_data = nullptr;
+  std::string event;
+  std::string id;
+  std::string error_message;
+  int error_code = 0;
+  bool has_error = false;
+};
+
+class holon_rpc_http_client {
+public:
+  using json = nlohmann::json;
+
+  explicit holon_rpc_http_client(std::string base_url, int timeout_ms = 10000)
+      : base_url_(std::move(base_url)), timeout_ms_(timeout_ms) {}
+
+  json invoke(const std::string &method, const json &params = json::object()) const {
+    auto parsed = parse_base_url();
+    auto path = method_path(parsed, method);
+    auto body = params.is_object() ? params.dump() : json::object().dump();
+    auto response = send_request(parsed, "POST", path, body, "application/json",
+                                 "application/json");
+    return decode_json_rpc_body(response.status_code, response.body);
+  }
+
+  std::vector<holon_rpc_sse_event> stream(
+      const std::string &method,
+      const json &params = json::object()) const {
+    auto parsed = parse_base_url();
+    auto path = method_path(parsed, method);
+    auto body = params.is_object() ? params.dump() : json::object().dump();
+    auto response = send_request(parsed, "POST", path, body, "application/json",
+                                 "text/event-stream");
+    return decode_sse(response);
+  }
+
+  std::vector<holon_rpc_sse_event> stream_query(
+      const std::string &method,
+      const std::map<std::string, std::string> &params) const {
+    auto parsed = parse_base_url();
+    auto path = method_path(parsed, method);
+    bool first = true;
+    for (const auto &[key, value] : params) {
+      path += first ? "?" : "&";
+      first = false;
+      path += uri_encode(key);
+      path += "=";
+      path += uri_encode(value);
+    }
+    auto response = send_request(parsed, "GET", path, "", "", "text/event-stream");
+    return decode_sse(response);
+  }
+
+private:
+#if HOLONS_HAS_OPENSSL
+  struct tls_state {
+    SSL_CTX *ctx = nullptr;
+    SSL *ssl = nullptr;
+
+    ~tls_state() {
+      if (ssl != nullptr) {
+        SSL_free(ssl);
+      }
+      if (ctx != nullptr) {
+        SSL_CTX_free(ctx);
+      }
+    }
+  };
+#endif
+
+  struct transport {
+    int fd = -1;
+#if HOLONS_HAS_OPENSSL
+    std::shared_ptr<tls_state> tls;
+#endif
+
+    ~transport() {
+      if (fd >= 0) {
+        close_fd(fd, true);
+      }
+    }
+  };
+
+  struct http_response {
+    int status_code = 0;
+    std::string body;
+    std::vector<holon_rpc_sse_event> sse_events;
+  };
+
+  parsed_uri parse_base_url() const {
+    auto parsed = parse_uri(base_url_);
+    if (parsed.scheme != "http" && parsed.scheme != "https") {
+      throw std::invalid_argument(
+          "holon-rpc http client requires http:// or https:// endpoint");
+    }
+    return parsed;
+  }
+
+  static std::string trim_method(std::string method) {
+    while (!method.empty() && method.front() == '/') {
+      method.erase(method.begin());
+    }
+    while (!method.empty() && method.back() == '/') {
+      method.pop_back();
+    }
+    return method;
+  }
+
+  static std::string method_path(const parsed_uri &parsed,
+                                 const std::string &method) {
+    std::string path = parsed.path.empty() ? "/api/v1/rpc" : parsed.path;
+    if (!path.empty() && path.back() == '/') {
+      path.pop_back();
+    }
+    return path + "/" + trim_method(method);
+  }
+
+  static std::string lower_header_name(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) {
+                     return static_cast<char>(std::tolower(ch));
+                   });
+    return value;
+  }
+
+  static std::string header_value(
+      const std::unordered_map<std::string, std::string> &headers,
+      const std::string &name) {
+    auto it = headers.find(lower_header_name(name));
+    return it == headers.end() ? std::string() : it->second;
+  }
+
+  static void ensure_openssl() {
+#if HOLONS_HAS_OPENSSL
+    static std::once_flag once;
+    std::call_once(once, []() {
+      OPENSSL_init_ssl(0, nullptr);
+      SSL_load_error_strings();
+    });
+#endif
+  }
+
+  transport open_transport(const parsed_uri &parsed) const {
+    transport out;
+#ifdef _WIN32
+    detail::ensure_winsock();
+#endif
+    out.fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (out.fd < 0) {
+      throw std::runtime_error("socket() failed");
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(parsed.port));
+    if (::inet_pton(AF_INET, parsed.host.c_str(), &addr.sin_addr) != 1) {
+      throw std::runtime_error("invalid host: " + parsed.host);
+    }
+    if (::connect(out.fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      throw std::runtime_error("connect() failed: " + last_socket_error());
+    }
+
+#if HOLONS_HAS_OPENSSL
+    if (parsed.secure) {
+      ensure_openssl();
+      auto params = parse_query_params(parsed.query);
+      bool insecure = false;
+      if (auto it = params.find("insecure"); it != params.end()) {
+        auto lowered = it->second;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char ch) {
+                         return static_cast<char>(std::tolower(ch));
+                       });
+        insecure = lowered == "1" || lowered == "true" || lowered == "yes";
+      }
+
+      out.tls = std::make_shared<tls_state>();
+      out.tls->ctx = SSL_CTX_new(TLS_client_method());
+      if (out.tls->ctx == nullptr) {
+        throw std::runtime_error("failed to create TLS context");
+      }
+      if (insecure) {
+        SSL_CTX_set_verify(out.tls->ctx, SSL_VERIFY_NONE, nullptr);
+      } else {
+        SSL_CTX_set_verify(out.tls->ctx, SSL_VERIFY_PEER, nullptr);
+        (void)SSL_CTX_set_default_verify_paths(out.tls->ctx);
+        if (auto it = params.find("ca"); it != params.end() && !it->second.empty()) {
+          if (SSL_CTX_load_verify_locations(out.tls->ctx, it->second.c_str(),
+                                            nullptr) != 1) {
+            throw std::runtime_error("failed to load TLS CA file: " + it->second);
+          }
+        }
+      }
+      out.tls->ssl = SSL_new(out.tls->ctx);
+      if (out.tls->ssl == nullptr) {
+        throw std::runtime_error("failed to create TLS session");
+      }
+      if (!parsed.host.empty()) {
+        (void)SSL_set_tlsext_host_name(out.tls->ssl, parsed.host.c_str());
+      }
+      if (SSL_set_fd(out.tls->ssl, out.fd) != 1 || SSL_connect(out.tls->ssl) != 1) {
+        throw std::runtime_error("TLS handshake failed");
+      }
+      if (!insecure && SSL_get_verify_result(out.tls->ssl) != X509_V_OK) {
+        throw std::runtime_error("TLS certificate verification failed");
+      }
+    }
+#else
+    if (parsed.secure) {
+      throw std::runtime_error("https:// requires OpenSSL support in cpp-holons");
+    }
+#endif
+
+    return out;
+  }
+
+  static bool send_all(const transport &transport, const void *data, size_t size) {
+    ensure_sigpipe_ignored();
+    const auto *ptr = static_cast<const uint8_t *>(data);
+    size_t sent = 0;
+    while (sent < size) {
+#if HOLONS_HAS_OPENSSL
+      if (transport.tls && transport.tls->ssl != nullptr) {
+        int n = SSL_write(
+            transport.tls->ssl, ptr + sent,
+            static_cast<int>(std::min(
+                size - sent,
+                static_cast<size_t>(std::numeric_limits<int>::max()))));
+        if (n <= 0) {
+          return false;
+        }
+        sent += static_cast<size_t>(n);
+        continue;
+      }
+#endif
+      size_t chunk = std::min(size - sent,
+                              static_cast<size_t>(std::numeric_limits<int>::max()));
+      ssize_t n = ::send(transport.fd, reinterpret_cast<const char *>(ptr + sent),
+                         static_cast<int>(chunk), 0);
+      if (n <= 0) {
+        return false;
+      }
+      sent += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  static ssize_t read_some(const transport &transport, void *data, size_t size) {
+#if HOLONS_HAS_OPENSSL
+    if (transport.tls && transport.tls->ssl != nullptr) {
+      return SSL_read(transport.tls->ssl, data,
+                      static_cast<int>(std::min(
+                          size, static_cast<size_t>(std::numeric_limits<int>::max()))));
+    }
+#endif
+    return ::recv(transport.fd, reinterpret_cast<char *>(data),
+                  static_cast<int>(std::min(
+                      size, static_cast<size_t>(std::numeric_limits<int>::max()))),
+                  0);
+  }
+
+  static bool read_exact(const transport &transport, void *data, size_t size) {
+    auto *ptr = static_cast<uint8_t *>(data);
+    size_t got = 0;
+    while (got < size) {
+      ssize_t n = read_some(transport, ptr + got, size - got);
+      if (n <= 0) {
+        return false;
+      }
+      got += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  static void append_header(std::ostringstream *request, const std::string &name,
+                            const std::string &value) {
+    *request << name << ": " << value << "\r\n";
+  }
+
+  http_response send_request(const parsed_uri &parsed, const std::string &verb,
+                             const std::string &path, const std::string &body,
+                             const std::string &content_type,
+                             const std::string &accept) const {
+    auto transport = open_transport(parsed);
+
+    std::ostringstream request;
+    request << verb << " " << path << " HTTP/1.1\r\n";
+    append_header(&request, "Host",
+                  parsed.host + ":" + std::to_string(parsed.port));
+    append_header(&request, "Connection", "close");
+    append_header(&request, "Accept", accept);
+    if (!content_type.empty()) {
+      append_header(&request, "Content-Type", content_type);
+    }
+    if (!body.empty()) {
+      append_header(&request, "Content-Length", std::to_string(body.size()));
+    } else if (verb == "POST") {
+      append_header(&request, "Content-Length", "0");
+    }
+    request << "\r\n";
+    request << body;
+
+    auto wire = request.str();
+    if (!send_all(transport, wire.data(), wire.size())) {
+      throw std::runtime_error("http request write failed");
+    }
+
+    std::string headers;
+    headers.reserve(4096);
+    char ch = '\0';
+    while (headers.find("\r\n\r\n") == std::string::npos) {
+      if (!read_exact(transport, &ch, 1)) {
+        throw std::runtime_error("http response header read failed");
+      }
+      headers.push_back(ch);
+      if (headers.size() > 32768) {
+        throw std::runtime_error("http response headers too large");
+      }
+    }
+
+    auto separator = headers.find("\r\n\r\n");
+    auto header_text = headers.substr(0, separator);
+    auto body_prefix = headers.substr(separator + 4);
+
+    std::istringstream lines(header_text);
+    std::string status_line;
+    std::getline(lines, status_line);
+    if (!status_line.empty() && status_line.back() == '\r') {
+      status_line.pop_back();
+    }
+    std::istringstream status_stream(status_line);
+    std::string http_version;
+    http_response response;
+    status_stream >> http_version >> response.status_code;
+    if (response.status_code <= 0) {
+      throw std::runtime_error("invalid http response status line");
+    }
+
+    std::unordered_map<std::string, std::string> header_map;
+    std::string line;
+    while (std::getline(lines, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      auto colon = line.find(':');
+      if (colon == std::string::npos) {
+        continue;
+      }
+      auto name = lower_header_name(line.substr(0, colon));
+      auto value = line.substr(colon + 1);
+      while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+      }
+      header_map[name] = value;
+    }
+
+    auto content_length_text = header_value(header_map, "content-length");
+    if (!content_length_text.empty() &&
+        (accept != "text/event-stream" || response.status_code >= 400)) {
+      size_t content_length = static_cast<size_t>(std::stoull(content_length_text));
+      response.body = body_prefix;
+      if (response.body.size() < content_length) {
+        std::string tail(content_length - response.body.size(), '\0');
+        if (!read_exact(transport, tail.data(), tail.size())) {
+          throw std::runtime_error("http response body read failed");
+        }
+        response.body += tail;
+      } else if (response.body.size() > content_length) {
+        response.body.resize(content_length);
+      }
+      return response;
+    }
+
+    if (accept != "text/event-stream" || response.status_code >= 400) {
+      response.body = body_prefix;
+      std::array<char, 4096> buffer{};
+      for (;;) {
+        auto n = read_some(transport, buffer.data(), buffer.size());
+        if (n <= 0) {
+          break;
+        }
+        response.body.append(buffer.data(), static_cast<size_t>(n));
+      }
+      return response;
+    }
+
+    std::string sse_text = body_prefix;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+      auto n = read_some(transport, buffer.data(), buffer.size());
+      if (n <= 0) {
+        break;
+      }
+      sse_text.append(buffer.data(), static_cast<size_t>(n));
+    }
+    response.sse_events = parse_sse_events(response.status_code, sse_text);
+    return response;
+  }
+
+  static json decode_json_rpc_body(int status_code, const std::string &body) {
+    json payload;
+    try {
+      payload = json::parse(body);
+    } catch (...) {
+      throw std::runtime_error("invalid http json-rpc response");
+    }
+
+    if (payload.contains("error") && payload["error"].is_object()) {
+      const auto &err = payload["error"];
+      throw holon_rpc_error(
+          err.value("code", -32603), err.value("message", std::string("internal error")),
+          err.contains("data") ? err["data"] : nullptr);
+    }
+
+    if (status_code >= 400) {
+      throw std::runtime_error("http status " + std::to_string(status_code));
+    }
+
+    if (payload.contains("result") && payload["result"].is_object()) {
+      return payload["result"];
+    }
+    return json::object();
+  }
+
+  static std::vector<holon_rpc_sse_event> decode_sse(
+      const http_response &response) {
+    if (response.status_code >= 400) {
+      if (!response.body.empty()) {
+        (void)decode_json_rpc_body(response.status_code, response.body);
+      }
+      throw std::runtime_error("http status " +
+                               std::to_string(response.status_code));
+    }
+    return response.sse_events;
+  }
+
+  static std::vector<holon_rpc_sse_event> parse_sse_events(
+      int status_code, const std::string &body) {
+    std::vector<holon_rpc_sse_event> events;
+    if (status_code >= 400) {
+      return events;
+    }
+
+    struct raw_event {
+      std::string event;
+      std::string id;
+      std::string data;
+    } current;
+
+    auto flush = [&]() {
+      if (current.event.empty() && current.id.empty() && current.data.empty()) {
+        return false;
+      }
+
+      holon_rpc_sse_event event;
+      event.event = current.event;
+      event.id = current.id;
+
+      if (current.event == "message" || current.event == "error") {
+        json payload = json::parse(current.data);
+        if (payload.contains("error") && payload["error"].is_object()) {
+          const auto &err = payload["error"];
+          event.has_error = true;
+          event.error_code = err.value("code", -32603);
+          event.error_message = err.value("message", std::string("internal error"));
+          event.error_data = err.contains("data") ? err["data"] : nullptr;
+        } else if (payload.contains("result") && payload["result"].is_object()) {
+          event.result = payload["result"];
+        }
+      }
+
+      events.push_back(std::move(event));
+      current = raw_event{};
+      return !events.empty() && events.back().event == "done";
+    };
+
+    std::istringstream in(body);
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      if (line.empty()) {
+        if (flush()) {
+          break;
+        }
+        continue;
+      }
+      if (line.rfind("event:", 0) == 0) {
+        current.event = line.substr(6);
+        while (!current.event.empty() &&
+               std::isspace(static_cast<unsigned char>(current.event.front()))) {
+          current.event.erase(current.event.begin());
+        }
+      } else if (line.rfind("id:", 0) == 0) {
+        current.id = line.substr(3);
+        while (!current.id.empty() &&
+               std::isspace(static_cast<unsigned char>(current.id.front()))) {
+          current.id.erase(current.id.begin());
+        }
+      } else if (line.rfind("data:", 0) == 0) {
+        current.data = line.substr(5);
+        while (!current.data.empty() &&
+               std::isspace(static_cast<unsigned char>(current.data.front()))) {
+          current.data.erase(current.data.begin());
+        }
+      }
+    }
+    (void)flush();
+    return events;
+  }
+
+  std::string base_url_;
+  int timeout_ms_ = 10000;
 };
 
 /// Parsed holon identity from a holon manifest.
@@ -2972,6 +3785,7 @@ inline void close_process_io(const std::shared_ptr<process_handle> &process) {
 }
 
 inline void relay_fd(int read_fd, int write_fd) {
+  ensure_sigpipe_ignored();
   std::array<char, 16 * 1024> buffer{};
   for (;;) {
     auto n = ::read(read_fd, buffer.data(), buffer.size());

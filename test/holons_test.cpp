@@ -1147,11 +1147,311 @@ func mustRaw(v interface{}) json.RawMessage {
 }
 )GO";
 
+const char *kGoTransportHelperSource = R"GO(
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/organic-programming/go-holons/pkg/holonrpc"
+	"nhooyr.io/websocket"
+)
+
+type rpcError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+type rpcMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+func main() {
+	mode := "wss"
+	if len(os.Args) > 1 {
+		mode = os.Args[1]
+	}
+
+	certFile := ""
+	if len(os.Args) > 2 {
+		certFile = os.Args[2]
+	}
+	keyFile := ""
+	if len(os.Args) > 3 {
+		keyFile = os.Args[3]
+	}
+
+	switch mode {
+	case "wss":
+		if err := writeSelfSignedCert(certFile, keyFile); err != nil {
+			log.Fatal(err)
+		}
+		runWSS(certFile, keyFile)
+	case "http":
+		runHTTP("http", "", "")
+	case "https":
+		if err := writeSelfSignedCert(certFile, keyFile); err != nil {
+			log.Fatal(err)
+		}
+		runHTTP("https", certFile, keyFile)
+	default:
+		log.Fatalf("unsupported mode %q", mode)
+	}
+}
+
+func runWSS(certFile, keyFile string) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols: []string{"holon-rpc"},
+		})
+		if err != nil {
+			http.Error(w, "upgrade failed", http.StatusBadRequest)
+			return
+		}
+		defer c.CloseNow()
+
+		ctx := r.Context()
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+
+			var msg rpcMessage
+			if err := json.Unmarshal(data, &msg); err != nil {
+				_ = writeError(ctx, c, nil, -32700, "parse error")
+				continue
+			}
+			if msg.JSONRPC != "2.0" {
+				_ = writeError(ctx, c, msg.ID, -32600, "invalid request")
+				continue
+			}
+
+			switch msg.Method {
+			case "rpc.heartbeat":
+				_ = writeResult(ctx, c, msg.ID, map[string]interface{}{})
+			case "echo.v1.Echo/Ping":
+				var params map[string]interface{}
+				_ = json.Unmarshal(msg.Params, &params)
+				if params == nil {
+					params = map[string]interface{}{}
+				}
+				params["transport"] = "wss"
+				_ = writeResult(ctx, c, msg.ID, params)
+			default:
+				_ = writeError(ctx, c, msg.ID, -32601, fmt.Sprintf("method %q not found", msg.Method))
+			}
+		}
+	})
+
+	srv := &http.Server{Handler: h}
+	go func() {
+		if err := srv.ServeTLS(ln, certFile, keyFile); err != nil && err != http.ErrServerClosed {
+			log.Printf("server error: %v", err)
+		}
+	}()
+
+	fmt.Printf("wss://%s/rpc?ca=%s\n", ln.Addr().String(), url.QueryEscape(certFile))
+	waitForShutdown(func(ctx context.Context) error {
+		return srv.Shutdown(ctx)
+	})
+}
+
+func runHTTP(scheme, certFile, keyFile string) {
+	bindURL := fmt.Sprintf("%s://127.0.0.1:0/api/v1/rpc", scheme)
+	if scheme == "https" {
+		bindURL = fmt.Sprintf(
+			"https://127.0.0.1:0/api/v1/rpc?cert=%s&key=%s",
+			url.QueryEscape(certFile),
+			url.QueryEscape(keyFile),
+		)
+	}
+
+	server := holonrpc.NewHTTPServer(bindURL)
+	server.Register("echo.v1.Echo/Ping", func(_ context.Context, params map[string]any) (map[string]any, error) {
+		out := cloneParams(params)
+		out["transport"] = scheme
+		return out, nil
+	})
+	server.RegisterStream("echo.v1.Echo/Watch", func(_ context.Context, params map[string]any, send func(map[string]any) error) error {
+		base := cloneParams(params)
+		base["transport"] = scheme
+
+		first := cloneParams(base)
+		first["step"] = "1"
+		if err := send(first); err != nil {
+			return err
+		}
+
+		time.Sleep(20 * time.Millisecond)
+
+		second := cloneParams(base)
+		second["step"] = "2"
+		return send(second)
+	})
+
+	addr, err := server.Start()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if scheme == "https" {
+		fmt.Printf("%s?ca=%s\n", addr, url.QueryEscape(certFile))
+	} else {
+		fmt.Println(addr)
+	}
+
+	waitForShutdown(func(ctx context.Context) error {
+		return server.Close(ctx)
+	})
+}
+
+func cloneParams(params map[string]any) map[string]any {
+	out := make(map[string]any, len(params))
+	for key, value := range params {
+		out[key] = value
+	}
+	return out
+}
+
+func waitForShutdown(closeFn func(context.Context) error) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	<-sigCh
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = closeFn(ctx)
+}
+
+func writeSelfSignedCert(certFile, keyFile string) error {
+	if certFile == "" || keyFile == "" {
+		return fmt.Errorf("cert and key paths are required")
+	}
+	if err := os.MkdirAll(filepath.Dir(certFile), 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyFile), 0o755); err != nil {
+		return err
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "127.0.0.1",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+	if certPEM == nil || keyPEM == nil {
+		return fmt.Errorf("encode pem failed")
+	}
+
+	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeResult(ctx context.Context, c *websocket.Conn, id interface{}, result interface{}) error {
+	payload, err := json.Marshal(rpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  mustRaw(result),
+	})
+	if err != nil {
+		return err
+	}
+	return c.Write(ctx, websocket.MessageText, payload)
+}
+
+func writeError(ctx context.Context, c *websocket.Conn, id interface{}, code int, message string) error {
+	payload, err := json.Marshal(rpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &rpcError{
+			Code:    code,
+			Message: message,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return c.Write(ctx, websocket.MessageText, payload)
+}
+
+func mustRaw(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return json.RawMessage(b)
+}
+)GO";
+
 struct go_helper_server {
   pid_t pid = -1;
   int stdout_fd = -1;
   int stderr_fd = -1;
   std::string helper_path;
+  std::vector<std::string> cleanup_paths;
 
   ~go_helper_server() {
     if (pid > 0) {
@@ -1178,6 +1478,11 @@ struct go_helper_server {
     }
     if (!helper_path.empty()) {
       std::remove(helper_path.c_str());
+    }
+    for (const auto &path : cleanup_paths) {
+      if (!path.empty()) {
+        std::remove(path.c_str());
+      }
     }
   }
 };
@@ -1243,6 +1548,79 @@ template <typename Func> void with_go_helper(const std::string &mode, Func f) {
   if (!read_line_with_timeout(server.stdout_fd, url, 20000)) {
     auto stderr_text = read_available(server.stderr_fd);
     throw std::runtime_error("Go holon-rpc helper did not output URL: " +
+                             stderr_text);
+  }
+  f(url);
+}
+
+go_helper_server start_go_transport_helper(const std::string &mode) {
+  auto sdk_dir = find_sdk_dir();
+  auto go_dir = sdk_dir + "/go-holons";
+
+  auto stamp = std::to_string(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  std::string helper_path = go_dir + "/tmp-holonrpc-transport-" + stamp + ".go";
+  std::string cert_path = go_dir + "/tmp-holonrpc-transport-" + stamp + ".crt";
+  std::string key_path = go_dir + "/tmp-holonrpc-transport-" + stamp + ".key";
+  {
+    std::ofstream out(helper_path);
+    out << kGoTransportHelperSource;
+  }
+
+  int out_pipe[2] = {-1, -1};
+  int err_pipe[2] = {-1, -1};
+  if (::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
+    throw std::runtime_error("pipe() failed");
+  }
+
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    throw std::runtime_error("fork() failed");
+  }
+
+  if (pid == 0) {
+    ::dup2(out_pipe[1], STDOUT_FILENO);
+    ::dup2(err_pipe[1], STDERR_FILENO);
+    ::close(out_pipe[0]);
+    ::close(out_pipe[1]);
+    ::close(err_pipe[0]);
+    ::close(err_pipe[1]);
+    ::chdir(go_dir.c_str());
+
+    auto go = resolve_go_binary();
+    std::vector<char *> argv;
+    argv.push_back(const_cast<char *>(go.c_str()));
+    argv.push_back(const_cast<char *>("run"));
+    argv.push_back(const_cast<char *>(helper_path.c_str()));
+    argv.push_back(const_cast<char *>(mode.c_str()));
+    argv.push_back(const_cast<char *>(cert_path.c_str()));
+    argv.push_back(const_cast<char *>(key_path.c_str()));
+    argv.push_back(nullptr);
+    ::execvp(go.c_str(), argv.data());
+    std::perror("execvp");
+    ::_exit(127);
+  }
+
+  ::close(out_pipe[1]);
+  ::close(err_pipe[1]);
+
+  go_helper_server server;
+  server.pid = pid;
+  server.stdout_fd = out_pipe[0];
+  server.stderr_fd = err_pipe[0];
+  server.helper_path = helper_path;
+  server.cleanup_paths.push_back(cert_path);
+  server.cleanup_paths.push_back(key_path);
+  return server;
+}
+
+template <typename Func>
+void with_go_transport_helper(const std::string &mode, Func f) {
+  auto server = start_go_transport_helper(mode);
+  std::string url;
+  if (!read_line_with_timeout(server.stdout_fd, url, 20000)) {
+    auto stderr_text = read_available(server.stderr_fd);
+    throw std::runtime_error("Go transport helper did not output URL: " +
                              stderr_text);
   }
   f(url);
@@ -1707,6 +2085,23 @@ int main() {
     ++passed;
   }
 
+  {
+    auto parsed = holons::parse_uri(
+        "https://example.com:8443/api/v1/rpc?ca=%2Ftmp%2Ftest-cert.pem");
+    assert(parsed.scheme == "https");
+    ++passed;
+    assert(parsed.host == "example.com");
+    ++passed;
+    assert(parsed.port == 8443);
+    ++passed;
+    assert(parsed.path == "/api/v1/rpc");
+    ++passed;
+    assert(parsed.query == "ca=%2Ftmp%2Ftest-cert.pem");
+    ++passed;
+    assert(parsed.secure);
+    ++passed;
+  }
+
   // --- listen tcp + runtime accept/read ---
   if (bind_restricted) {
     std::fprintf(stderr, "SKIP: listen tcp (%s)\n", bind_reason.c_str());
@@ -1862,23 +2257,6 @@ int main() {
     ++passed;
   }
 
-  try {
-    holons::holon_rpc_client client;
-    client.connect("wss://127.0.0.1:8443/rpc");
-    assert(false && "wss:// should be unsupported");
-  } catch (const std::runtime_error &error) {
-    assert(std::string(error.what()).find("wss:// is not supported") !=
-           std::string::npos);
-    ++passed;
-  }
-
-  try {
-    (void)holons::parse_uri("http://127.0.0.1:8080/api/v1/rpc");
-    assert(false && "http:// should be unsupported");
-  } catch (const std::invalid_argument &) {
-    ++passed;
-  }
-
   // --- parse_flags ---
   assert(holons::parse_flags({"--listen", "tcp://:8080"}) == "tcp://:8080");
   ++passed;
@@ -2006,7 +2384,8 @@ int main() {
 
   // --- parse_holon ---
   {
-    std::string path = make_temp_proto_path();
+    auto root = make_temp_dir("holons_cpp_identity_");
+    auto path = (root / "holon.proto").string();
     {
       std::ofstream f(path);
       f << "syntax = \"proto3\";\n"
@@ -2033,7 +2412,7 @@ int main() {
     auto manifest_path = holons::identity::find_manifest(path);
     assert(manifest_path.has_value());
     ++passed;
-    std::remove(path.c_str());
+    std::filesystem::remove_all(root);
   }
 
   // --- describe ---
@@ -2486,6 +2865,71 @@ int main() {
         ++passed;
 
         client.close();
+      });
+    }
+
+    {
+      with_go_transport_helper("wss", [&](const std::string &url) {
+        holons::holon_rpc_client client(250, 250, 100, 400);
+        client.connect(url);
+        auto out =
+            client.invoke("echo.v1.Echo/Ping", json{{"message", "secure"}});
+        assert(out["message"].get<std::string>() == "secure");
+        ++passed;
+        assert(out["transport"].get<std::string>() == "wss");
+        ++passed;
+        client.close();
+      });
+    }
+
+    {
+      with_go_transport_helper("http", [&](const std::string &url) {
+        holons::holon_rpc_http_client client(url);
+
+        auto unary =
+            client.invoke("echo.v1.Echo/Ping", json{{"message", "http"}});
+        assert(unary["message"].get<std::string>() == "http");
+        ++passed;
+        assert(unary["transport"].get<std::string>() == "http");
+        ++passed;
+
+        auto stream =
+            client.stream("echo.v1.Echo/Watch", json{{"message", "post-stream"}});
+        assert(stream.size() == 3);
+        ++passed;
+        assert(stream[0].event == "message");
+        ++passed;
+        assert(stream[0].id == "1");
+        ++passed;
+        assert(stream[0].result["message"].get<std::string>() == "post-stream");
+        ++passed;
+        assert(stream[1].result["step"].get<std::string>() == "2");
+        ++passed;
+        assert(stream[2].event == "done");
+        ++passed;
+
+        auto query = client.stream_query("echo.v1.Echo/Watch",
+                                         {{"message", "query-stream"}});
+        assert(query.size() == 3);
+        ++passed;
+        assert(query[0].result["message"].get<std::string>() == "query-stream");
+        ++passed;
+        assert(query[0].result["transport"].get<std::string>() == "http");
+        ++passed;
+        assert(query[2].event == "done");
+        ++passed;
+      });
+    }
+
+    {
+      with_go_transport_helper("https", [&](const std::string &url) {
+        holons::holon_rpc_http_client client(url);
+        auto unary =
+            client.invoke("echo.v1.Echo/Ping", json{{"message", "https"}});
+        assert(unary["message"].get<std::string>() == "https");
+        ++passed;
+        assert(unary["transport"].get<std::string>() == "https");
+        ++passed;
       });
     }
   }
