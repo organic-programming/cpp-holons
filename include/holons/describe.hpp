@@ -81,7 +81,12 @@ struct describe_response {
 struct registration {
   std::string service_name;
   std::string method_name;
+#if HOLONS_HAS_STATIC_DESCRIBE_PROTO
+  std::function<holons::v1::DescribeResponse(
+      const holons::v1::DescribeRequest &)> handler;
+#else
   std::function<describe_response(const describe_request &)> handler;
+#endif
 };
 
 namespace detail {
@@ -754,13 +759,22 @@ inline describe_response build_response(const std::filesystem::path &proto_dir) 
   return response;
 }
 
-inline registration make_registration(const std::filesystem::path &proto_dir) {
+inline registration make_registration() {
   registration reg;
   reg.service_name = std::string(kHolonMetaServiceName);
   reg.method_name = std::string(kDescribeMethodName);
-  reg.handler = [proto_dir](const describe_request &) {
-    return build_response(proto_dir);
+#if HOLONS_HAS_STATIC_DESCRIBE_PROTO
+  reg.handler = [](const holons::v1::DescribeRequest &) {
+    auto response = registered_static_response();
+    if (!response) {
+      throw std::runtime_error(
+          std::string(kNoIncodeDescriptionRegistered));
+    }
+    return *response;
   };
+#else
+  reg.handler = [](const describe_request &) { return describe_response{}; };
+#endif
   return reg;
 }
 

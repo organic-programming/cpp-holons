@@ -1,5 +1,7 @@
+#include "../include/holons/discover.hpp"
 #include "../include/holons/describe.hpp"
 #include "../include/holons/holons.hpp"
+#include "../include/holons/identity.hpp"
 #include "../include/holons/serve.hpp"
 
 namespace {
@@ -437,6 +439,30 @@ std::string make_temp_unix_socket_path() {
   std::remove(tmpl);
   return path;
 }
+
+#if HOLONS_HAS_HOLONMETA_GRPC
+holons::v1::DescribeResponse make_static_describe_response() {
+  holons::v1::DescribeResponse response;
+  auto *identity = response.mutable_manifest()->mutable_identity();
+  identity->set_schema("holon/v1");
+  identity->set_uuid("static-holon-0000");
+  identity->set_given_name("Static");
+  identity->set_family_name("Holon");
+  identity->set_motto("Registered from generated code.");
+  identity->set_composer("cpp-holons-test");
+  identity->set_status("draft");
+  identity->set_born("2026-03-23");
+  response.mutable_manifest()->set_lang("cpp");
+
+  auto *service = response.add_services();
+  service->set_name("static.v1.Echo");
+  service->set_description("Static test service.");
+  auto *method = service->add_methods();
+  method->set_name("Ping");
+  method->set_description("Replies with the payload.");
+  return response;
+}
+#endif
 
 std::string resolve_go_binary() {
   std::string preferred = "/Users/bpds/go/go1.25.1/bin/go";
@@ -1861,12 +1887,18 @@ int main() {
         << "  lang: \"cpp\"\n"
         << "};\n";
     }
-    auto id = holons::parse_holon(path);
+    auto id = holons::identity::read(path);
     assert(id.uuid == "abc-123");
     ++passed;
     assert(id.given_name == "test");
     ++passed;
     assert(id.lang == "cpp");
+    ++passed;
+    auto resolved = holons::identity::resolve(path);
+    assert(resolved.manifest.lang == "cpp");
+    ++passed;
+    auto manifest_path = holons::identity::find_manifest(path);
+    assert(manifest_path.has_value());
     ++passed;
     std::remove(path.c_str());
   }
@@ -1924,18 +1956,21 @@ int main() {
     assert(method.input_fields[0].example == "\"hello\"");
     ++passed;
 
-    auto registration =
-        holons::describe::make_registration(root / "protos");
+#if HOLONS_HAS_HOLONMETA_GRPC
+    auto static_response = make_static_describe_response();
+    holons::describe::use_static_response(static_response);
+    auto registration = holons::describe::make_registration();
     assert(registration.service_name == "holons.v1.HolonMeta");
     ++passed;
     assert(registration.method_name == "Describe");
     ++passed;
-    auto registered =
-        registration.handler(holons::describe::describe_request{});
-    assert(registered.manifest.identity.given_name == "Echo");
+    auto registered = registration.handler(holons::v1::DescribeRequest{});
+    assert(registered.manifest().identity().given_name() == "Static");
     ++passed;
-    assert(registered.services.size() == 1);
+    assert(registered.services_size() == 1);
     ++passed;
+    holons::describe::clear_static_response();
+#endif
 
     std::filesystem::remove_all(root);
   }
@@ -2021,6 +2056,11 @@ int main() {
     assert(discovered[0].manifest->build.runner == "go-module");
     ++passed;
     assert(discovered[1].slug == "beta-rust");
+    ++passed;
+    auto nearby = holons::find_nearby_by_slug(root, "alpha-go");
+    assert(nearby.has_value());
+    ++passed;
+    assert(nearby->relative_path.generic_string() == "holons/alpha");
     ++passed;
 
     std::filesystem::current_path(root);
