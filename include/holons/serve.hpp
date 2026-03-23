@@ -411,22 +411,23 @@ inline void fill_manifest(const HolonManifest &source,
 
 class holon_meta_service final : public holons::v1::HolonMeta::Service {
 public:
-  explicit holon_meta_service(std::filesystem::path proto_dir)
-      : proto_dir_(std::move(proto_dir)) {}
+  explicit holon_meta_service(const holons::v1::DescribeResponse &response) {
+    response_.CopyFrom(response);
+  }
 
   grpc::Status Describe(grpc::ServerContext *,
                         const holons::v1::DescribeRequest *,
                         holons::v1::DescribeResponse *response) override {
-    auto doc = describe::build_response(proto_dir_);
-    fill_manifest(doc.manifest, response->mutable_manifest());
-    for (const auto &service : doc.services) {
-      fill_service_doc(service, response->add_services());
+    if (response == nullptr) {
+      return grpc::Status(grpc::StatusCode::INTERNAL,
+                          "Describe response is required");
     }
+    response->CopyFrom(response_);
     return grpc::Status();
   }
 
 private:
-  std::filesystem::path proto_dir_;
+  holons::v1::DescribeResponse response_;
 };
 
 inline std::shared_ptr<grpc::Service> maybe_make_holon_meta_service(
@@ -435,18 +436,13 @@ inline std::shared_ptr<grpc::Service> maybe_make_holon_meta_service(
     return nullptr;
   }
 
-  auto cwd = std::filesystem::current_path();
-  auto proto_dir = cwd / "protos";
-  try {
-    (void)resolve_manifest_path(proto_dir);
-  } catch (const std::runtime_error &error) {
-    if (std::string(error.what()).rfind("no holon.proto found near ", 0) == 0) {
-      return nullptr;
-    }
-    throw;
+  auto response = describe::registered_static_response();
+  if (!response) {
+    throw std::runtime_error(
+        std::string(describe::kNoIncodeDescriptionRegistered));
   }
 
-  return std::make_shared<holon_meta_service>(proto_dir);
+  return std::make_shared<holon_meta_service>(*response);
 }
 #else
 inline std::shared_ptr<grpc::Service> maybe_make_holon_meta_service(
@@ -508,10 +504,15 @@ inline server_handle start(const std::vector<std::string> &listen_uris,
   }
 
   std::vector<std::shared_ptr<void>> owned_objects;
-  auto holon_meta_service = detail::maybe_make_holon_meta_service(opts);
-  if (holon_meta_service) {
-    builder.RegisterService(holon_meta_service.get());
-    owned_objects.push_back(holon_meta_service);
+  try {
+    auto holon_meta_service = detail::maybe_make_holon_meta_service(opts);
+    if (holon_meta_service) {
+      builder.RegisterService(holon_meta_service.get());
+      owned_objects.push_back(holon_meta_service);
+    }
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "HolonMeta registration failed: %s\n", error.what());
+    throw;
   }
   if (register_services) {
     register_services(builder);

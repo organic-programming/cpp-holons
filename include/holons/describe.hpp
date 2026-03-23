@@ -2,8 +2,18 @@
 
 #include "holons.hpp"
 
+#if __has_include("holons/v1/describe.pb.h") &&                                \
+    __has_include("holons/v1/describe.grpc.pb.h")
+#include "holons/v1/describe.pb.h"
+#include "holons/v1/describe.grpc.pb.h"
+#define HOLONS_HAS_STATIC_DESCRIBE_PROTO 1
+#else
+#define HOLONS_HAS_STATIC_DESCRIBE_PROTO 0
+#endif
+
 #include <cctype>
 #include <functional>
+#include <memory>
 #include <regex>
 #include <set>
 #include <unordered_map>
@@ -12,6 +22,8 @@ namespace holons::describe {
 
 constexpr std::string_view kHolonMetaServiceName = "holons.v1.HolonMeta";
 constexpr std::string_view kDescribeMethodName = "Describe";
+constexpr std::string_view kNoIncodeDescriptionRegistered =
+    "no Incode Description registered — run op build";
 
 enum class field_label {
   unspecified = 0,
@@ -678,6 +690,52 @@ inline service_doc to_service_doc(const service_def &service,
 }
 
 } // namespace detail
+
+#if HOLONS_HAS_STATIC_DESCRIBE_PROTO
+namespace detail {
+
+inline std::mutex &static_response_mutex() {
+  static std::mutex mu;
+  return mu;
+}
+
+inline std::shared_ptr<holons::v1::DescribeResponse> &static_response() {
+  static std::shared_ptr<holons::v1::DescribeResponse> response;
+  return response;
+}
+
+} // namespace detail
+
+inline void use_static_response(const holons::v1::DescribeResponse *response) {
+  std::lock_guard<std::mutex> lock(detail::static_response_mutex());
+  if (response == nullptr) {
+    detail::static_response().reset();
+    return;
+  }
+
+  auto copy = std::make_shared<holons::v1::DescribeResponse>();
+  copy->CopyFrom(*response);
+  detail::static_response() = std::move(copy);
+}
+
+inline void use_static_response(const holons::v1::DescribeResponse &response) {
+  use_static_response(&response);
+}
+
+inline void clear_static_response() { use_static_response(nullptr); }
+
+inline std::shared_ptr<holons::v1::DescribeResponse>
+registered_static_response() {
+  std::lock_guard<std::mutex> lock(detail::static_response_mutex());
+  if (!detail::static_response()) {
+    return nullptr;
+  }
+
+  auto copy = std::make_shared<holons::v1::DescribeResponse>();
+  copy->CopyFrom(*detail::static_response());
+  return copy;
+}
+#endif
 
 inline describe_response build_response(const std::filesystem::path &proto_dir) {
   auto resolved = parse_resolved_manifest(resolve_manifest_path(proto_dir).string());

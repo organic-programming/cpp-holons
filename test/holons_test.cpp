@@ -428,6 +428,16 @@ std::string make_temp_proto_path() {
   return path;
 }
 
+std::string make_temp_unix_socket_path() {
+  char tmpl[] = "/tmp/holons_cpp_sock_XXXXXX";
+  int fd = ::mkstemp(tmpl);
+  assert(fd >= 0);
+  ::close(fd);
+  std::string path = std::string(tmpl) + ".sock";
+  std::remove(tmpl);
+  return path;
+}
+
 std::string resolve_go_binary() {
   std::string preferred = "/Users/bpds/go/go1.25.1/bin/go";
   if (::access(preferred.c_str(), X_OK) == 0) {
@@ -1791,6 +1801,43 @@ int main() {
   auto serve_options = holons::serve::parse_options({"--reflect"});
   assert(serve_options.reflect);
   ++passed;
+
+#if HOLONS_HAS_GRPCPP && HOLONS_HAS_HOLONMETA_GRPC
+  // --- serve requires registered static describe ---
+  {
+    holons::describe::clear_static_response();
+
+#ifdef _WIN32
+    if (bind_restricted) {
+      std::fprintf(stderr, "SKIP: serve missing describe (%s)\n",
+                   bind_reason.c_str());
+      ++passed;
+    } else {
+      try {
+        (void)holons::serve::start("tcp://127.0.0.1:0",
+                                   [](grpc::ServerBuilder &) {});
+        assert(false && "serve should require registered static describe");
+      } catch (const std::runtime_error &error) {
+        assert(std::string(error.what()) ==
+               "no Incode Description registered — run op build");
+        ++passed;
+      }
+    }
+#else
+    auto socket_path = make_temp_unix_socket_path();
+    try {
+      (void)holons::serve::start("unix://" + socket_path,
+                                 [](grpc::ServerBuilder &) {});
+      assert(false && "serve should require registered static describe");
+    } catch (const std::runtime_error &error) {
+      assert(std::string(error.what()) ==
+             "no Incode Description registered — run op build");
+      ++passed;
+    }
+    std::remove(socket_path.c_str());
+#endif
+  }
+#endif
 
   // --- proto_field_value ---
   assert(holons::proto_field_value("uuid: \"abc-123\"", "uuid") == "abc-123");
