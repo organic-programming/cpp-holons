@@ -420,6 +420,23 @@ int connect_tcp(const std::string &host, int port) {
   return fd;
 }
 
+int connect_unix(const std::string &path) {
+  int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
 std::string make_temp_proto_path() {
   char tmpl[] = "/tmp/holons_cpp_test_XXXXXX";
   int fd = ::mkstemp(tmpl);
@@ -1735,6 +1752,42 @@ int main() {
     holons::close_listener(lis);
   }
 
+  // --- listen unix + runtime accept/read ---
+  {
+    auto socket_path = make_temp_unix_socket_path();
+    auto lis = holons::listen("unix://" + socket_path);
+    auto *unix = std::get_if<holons::unix_listener>(&lis);
+    assert(unix != nullptr);
+    ++passed;
+    assert(unix->path == socket_path);
+    ++passed;
+
+    int cfd = connect_unix(socket_path);
+    assert(cfd >= 0);
+    ++passed;
+
+    auto server_conn = holons::accept(lis);
+    assert(server_conn.scheme == "unix");
+    ++passed;
+
+    const char *msg = "unix";
+    auto wrote = ::write(cfd, msg, 4);
+    assert(wrote == 4);
+    ++passed;
+
+    char buf[8] = {0};
+    auto read_n = holons::conn_read(server_conn, buf, sizeof(buf));
+    assert(read_n == 4);
+    ++passed;
+    assert(std::string(buf, 4) == "unix");
+    ++passed;
+
+    holons::close_connection(server_conn);
+    ::close(cfd);
+    holons::close_listener(lis);
+    std::remove(socket_path.c_str());
+  }
+
   // --- listen stdio/mem/ws ---
   {
     auto stdio_lis = holons::listen("stdio://");
@@ -1805,6 +1858,23 @@ int main() {
   try {
     (void)holons::listen("ftp://host");
     assert(false && "should have thrown");
+  } catch (const std::invalid_argument &) {
+    ++passed;
+  }
+
+  try {
+    holons::holon_rpc_client client;
+    client.connect("wss://127.0.0.1:8443/rpc");
+    assert(false && "wss:// should be unsupported");
+  } catch (const std::runtime_error &error) {
+    assert(std::string(error.what()).find("wss:// is not supported") !=
+           std::string::npos);
+    ++passed;
+  }
+
+  try {
+    (void)holons::parse_uri("http://127.0.0.1:8080/api/v1/rpc");
+    assert(false && "http:// should be unsupported");
   } catch (const std::invalid_argument &) {
     ++passed;
   }
@@ -2188,6 +2258,23 @@ int main() {
       holons::disconnect(channel);
       assert(pid_exists(server.pid));
       ++passed;
+    }
+
+    {
+      auto socket_path = make_temp_unix_socket_path();
+      auto server = start_child_process(
+          echo_server, {"--listen", "unix://" + socket_path});
+      auto uri = wait_for_child_uri(server, 20000);
+      assert(uri == "unix://" + socket_path);
+      ++passed;
+
+      auto channel = holons::connect(uri);
+      assert(channel_ready(channel, 2000));
+      ++passed;
+      holons::disconnect(channel);
+      assert(pid_exists(server.pid));
+      ++passed;
+      std::remove(socket_path.c_str());
     }
 
     {
