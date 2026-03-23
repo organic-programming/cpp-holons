@@ -1865,6 +1865,69 @@ int main() {
   }
 #endif
 
+#if HOLONS_HAS_GRPCPP && HOLONS_HAS_HOLONMETA_GRPC
+  // --- describe is static-only at runtime, even without adjacent protos ---
+  {
+    auto static_response = make_static_describe_response();
+    holons::describe::use_static_response(static_response);
+
+#ifdef _WIN32
+    if (bind_restricted) {
+      std::fprintf(stderr, "SKIP: static-only describe without protos (%s)\n",
+                   bind_reason.c_str());
+      ++passed;
+    } else {
+      auto empty_root = make_temp_dir("holons_cpp_static_only_");
+      cwd_guard cwd(empty_root);
+
+      holons::serve::options opts;
+      opts.announce = false;
+      auto handle = holons::serve::start(
+          "tcp://127.0.0.1:0", [](grpc::ServerBuilder &) {}, opts);
+      auto advertised = handle.listeners().front().advertised;
+      auto channel = holons::connect(advertised);
+      auto stub = holons::v1::HolonMeta::NewStub(channel);
+      grpc::ClientContext context;
+      holons::v1::DescribeResponse response;
+      auto status =
+          stub->Describe(&context, holons::v1::DescribeRequest{}, &response);
+      assert(status.ok());
+      ++passed;
+      assert(response.manifest().identity().given_name() == "Static");
+      ++passed;
+      assert(response.services_size() == 1);
+      ++passed;
+      handle.stop();
+    }
+#else
+    auto empty_root = make_temp_dir("holons_cpp_static_only_");
+    cwd_guard cwd(empty_root);
+    auto socket_path = make_temp_unix_socket_path();
+
+    holons::serve::options opts;
+    opts.announce = false;
+    auto handle = holons::serve::start(
+        "unix://" + socket_path, [](grpc::ServerBuilder &) {}, opts);
+    auto channel = holons::connect("unix://" + socket_path);
+    auto stub = holons::v1::HolonMeta::NewStub(channel);
+    grpc::ClientContext context;
+    holons::v1::DescribeResponse response;
+    auto status =
+        stub->Describe(&context, holons::v1::DescribeRequest{}, &response);
+    assert(status.ok());
+    ++passed;
+    assert(response.manifest().identity().given_name() == "Static");
+    ++passed;
+    assert(response.services_size() == 1);
+    ++passed;
+    handle.stop();
+    std::remove(socket_path.c_str());
+#endif
+
+    holons::describe::clear_static_response();
+  }
+#endif
+
   // --- proto_field_value ---
   assert(holons::proto_field_value("uuid: \"abc-123\"", "uuid") == "abc-123");
   ++passed;
