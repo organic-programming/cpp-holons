@@ -55,7 +55,7 @@ type echoService interface {
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
 }
 
-type memEchoServer struct {
+type echoServer struct {
 	sdk     string
 	version string
 }
@@ -72,7 +72,7 @@ func (jsonCodec) Unmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-func (s memEchoServer) Ping(_ context.Context, in *PingRequest) (*PingResponse, error) {
+func (s echoServer) Ping(_ context.Context, in *PingRequest) (*PingResponse, error) {
 	return &PingResponse{
 		Message: in.Message,
 		SDK:     s.sdk,
@@ -186,7 +186,7 @@ func parseFlags() (options, error) {
 		uri = normalizeURI(flag.Arg(0))
 	default:
 		return options{}, fmt.Errorf(
-			"usage: echo-client-go [flags] [tcp://host:port|unix://path|stdio://|mem://name|ws://host:port/grpc]",
+			"usage: echo-client-go [flags] [tcp://host:port|unix://path|stdio://|ws://host:port/grpc]",
 		)
 	}
 
@@ -223,11 +223,6 @@ func dial(
 		return conn, child, nil, err
 	}
 
-	if strings.HasPrefix(args.uri, "mem://") {
-		conn, cleanup, err := dialMem(ctx, args.serverSDK)
-		return conn, nil, cleanup, err
-	}
-
 	if strings.HasPrefix(args.uri, "ws://") || strings.HasPrefix(args.uri, "wss://") {
 		wsURI, err := normalizeWebSocketURI(args.uri)
 		if err != nil {
@@ -257,39 +252,6 @@ func dial(
 		return nil, nil, nil, err
 	}
 	return conn, nil, nil, nil
-}
-
-func dialMem(ctx context.Context, serverSDK string) (*grpc.ClientConn, func(), error) {
-	mem := transport.NewMemListener()
-
-	server := grpc.NewServer(grpc.ForceServerCodec(jsonCodec{}))
-	server.RegisterService(&echoServiceDesc, memEchoServer{
-		sdk:     serverSDK,
-		version: defaultVersion,
-	})
-
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Serve(mem)
-	}()
-
-	conn, err := grpcclient.DialMem(ctx, mem)
-	if err != nil {
-		server.Stop()
-		_ = mem.Close()
-		return nil, nil, err
-	}
-
-	cleanup := func() {
-		server.Stop()
-		_ = mem.Close()
-		select {
-		case <-done:
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
-
-	return conn, cleanup, nil
 }
 
 func normalizeWebSocketURI(rawURI string) (string, error) {
@@ -355,7 +317,7 @@ func dialEphemeralWebSocket(ctx context.Context, serverSDK string) (*grpc.Client
 	}
 
 	server := grpc.NewServer(grpc.ForceServerCodec(jsonCodec{}))
-	server.RegisterService(&echoServiceDesc, memEchoServer{
+	server.RegisterService(&echoServiceDesc, echoServer{
 		sdk:     serverSDK,
 		version: defaultVersion,
 	})

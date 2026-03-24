@@ -345,14 +345,6 @@ struct stdio_listener {
   bool consumed = false;
 };
 
-struct mem_listener {
-  std::string address = "mem://";
-  int server_fd = -1;
-  int client_fd = -1;
-  bool server_consumed = false;
-  bool client_consumed = false;
-};
-
 struct ws_listener {
   std::string host;
   int port = 0;
@@ -361,8 +353,7 @@ struct ws_listener {
 };
 
 using listener =
-    std::variant<tcp_listener, unix_listener, stdio_listener, mem_listener,
-                 ws_listener>;
+    std::variant<tcp_listener, unix_listener, stdio_listener, ws_listener>;
 
 struct connection {
   int read_fd = -1;
@@ -410,12 +401,6 @@ inline parsed_uri parse_uri(const std::string &uri) {
 
   if (s == "stdio") {
     return {"stdio://", "stdio", "", 0, "", "", false};
-  }
-
-  if (s == "mem") {
-    std::string raw = uri.rfind("mem://", 0) == 0 ? uri : "mem://";
-    std::string name = raw.size() > 6 ? raw.substr(6) : "";
-    return {raw, "mem", "", 0, name, "", false};
   }
 
   if (s == "ws" || s == "wss") {
@@ -615,17 +600,6 @@ inline listener listen(const std::string &uri) {
 
   if (parsed.scheme == "stdio")
     return stdio_listener{parsed.raw, false};
-  if (parsed.scheme == "mem") {
-    int fds[2] = {-1, -1};
-#ifdef _WIN32
-    if (win_socketpair(fds) != 0) {
-#else
-    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
-#endif
-      throw std::runtime_error("mem socketpair() failed");
-    }
-    return mem_listener{parsed.raw, fds[0], fds[1], false, false};
-  }
   if (parsed.scheme == "ws" || parsed.scheme == "wss")
     return ws_listener{parsed.host, parsed.port, parsed.path, parsed.secure};
 
@@ -635,7 +609,6 @@ inline listener listen(const std::string &uri) {
 /// Accept one connection from a listener.
 /// - tcp/unix: OS socket accept
 /// - stdio: single connection over stdin/stdout
-/// - mem: server side of in-process pair
 inline connection accept(listener &lis) {
   if (auto *tcp = std::get_if<tcp_listener>(&lis)) {
     int fd = ::accept(tcp->fd, nullptr, nullptr);
@@ -661,37 +634,12 @@ inline connection accept(listener &lis) {
     return connection{STDIN_FILENO, STDOUT_FILENO, "stdio", false, false};
   }
 
-  if (auto *mem = std::get_if<mem_listener>(&lis)) {
-    if (mem->server_consumed || mem->server_fd < 0) {
-      throw std::runtime_error("mem:// server side already consumed");
-    }
-    mem->server_consumed = true;
-    int fd = mem->server_fd;
-    mem->server_fd = -1;
-    return connection{fd, fd, "mem", true, true};
-  }
-
   if (std::holds_alternative<ws_listener>(lis)) {
     throw std::runtime_error(
         "ws/wss runtime accept is unsupported (metadata-only listener)");
   }
 
   throw std::runtime_error("listener variant cannot accept");
-}
-
-/// Dial the client side of a mem:// listener.
-inline connection mem_dial(listener &lis) {
-  auto *mem = std::get_if<mem_listener>(&lis);
-  if (mem == nullptr) {
-    throw std::invalid_argument("mem_dial() requires mem:// listener");
-  }
-  if (mem->client_consumed || mem->client_fd < 0) {
-    throw std::runtime_error("mem:// client side already consumed");
-  }
-  mem->client_consumed = true;
-  int fd = mem->client_fd;
-  mem->client_fd = -1;
-  return connection{fd, fd, "mem", true, true};
 }
 
 inline ssize_t conn_read(const connection &conn, void *buf, size_t n) {
@@ -759,16 +707,6 @@ inline void close_listener(listener &lis) {
     if (!unix_lis->path.empty())
       unlink_path(unix_lis->path.c_str());
     return;
-  }
-  if (auto *mem = std::get_if<mem_listener>(&lis)) {
-    if (mem->server_fd >= 0) {
-      close_fd(mem->server_fd, true);
-      mem->server_fd = -1;
-    }
-    if (mem->client_fd >= 0) {
-      close_fd(mem->client_fd, true);
-      mem->client_fd = -1;
-    }
   }
 }
 

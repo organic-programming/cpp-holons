@@ -158,8 +158,6 @@ int main() {
   ++passed;
   assert(holons::scheme("stdio://") == "stdio");
   ++passed;
-  assert(holons::scheme("mem://") == "mem");
-  ++passed;
 
   auto parsed = holons::parse_uri("wss://example.com:8443");
   assert(parsed.scheme == "wss");
@@ -218,25 +216,6 @@ int main() {
   assert(stdio_conn.scheme == "stdio");
   ++passed;
   holons::close_connection(stdio_conn);
-
-  auto mem_lis = holons::listen("mem://unit");
-  auto mem_client = holons::mem_dial(mem_lis);
-  auto mem_server = holons::accept(mem_lis);
-  const char *msg = "mem";
-  auto mem_wrote = holons::conn_write(mem_client, msg, 3);
-  assert(mem_wrote == 3);
-  ++passed;
-
-  char mem_buf[8] = {0};
-  auto mem_read = holons::conn_read(mem_server, mem_buf, sizeof(mem_buf));
-  assert(mem_read == 3);
-  ++passed;
-  assert(std::string(mem_buf, 3) == "mem");
-  ++passed;
-
-  holons::close_connection(mem_server);
-  holons::close_connection(mem_client);
-  holons::close_listener(mem_lis);
 
   try {
     (void)holons::listen("unix://C:/tmp/holons.sock");
@@ -1909,9 +1888,9 @@ int main() {
 
   // --- certification runtime transports ---
   {
-    int mem_exit = command_exit_code(
-        "./bin/echo-client --message cert-mem mem:// >/dev/null 2>&1");
-    assert(mem_exit == 0);
+    int stdio_exit = command_exit_code(
+        "./bin/echo-client --message cert-stdio stdio:// >/dev/null 2>&1");
+    assert(stdio_exit == 0);
     ++passed;
 
     if (bind_restricted) {
@@ -2059,8 +2038,6 @@ int main() {
   ++passed;
   assert(holons::scheme("stdio://") == "stdio");
   ++passed;
-  assert(holons::scheme("mem://") == "mem");
-  ++passed;
   assert(holons::scheme("ws://host:8080") == "ws");
   ++passed;
   assert(holons::scheme("wss://host:443") == "wss");
@@ -2183,7 +2160,7 @@ int main() {
     std::remove(socket_path.c_str());
   }
 
-  // --- listen stdio/mem/ws ---
+  // --- listen stdio/ws ---
   {
     auto stdio_lis = holons::listen("stdio://");
     assert(std::holds_alternative<holons::stdio_listener>(stdio_lis));
@@ -2200,33 +2177,6 @@ int main() {
     } catch (const std::runtime_error &) {
       ++passed;
     }
-
-    auto mem_lis = holons::listen("mem://unit");
-    assert(std::holds_alternative<holons::mem_listener>(mem_lis));
-    ++passed;
-
-    auto mem_client = holons::mem_dial(mem_lis);
-    auto mem_server = holons::accept(mem_lis);
-    assert(mem_client.scheme == "mem");
-    ++passed;
-    assert(mem_server.scheme == "mem");
-    ++passed;
-
-    const char *msg = "mem";
-    auto mem_wrote = holons::conn_write(mem_client, msg, 3);
-    assert(mem_wrote == 3);
-    ++passed;
-
-    char mem_buf[8] = {0};
-    auto mem_read = holons::conn_read(mem_server, mem_buf, sizeof(mem_buf));
-    assert(mem_read == 3);
-    ++passed;
-    assert(std::string(mem_buf, 3) == "mem");
-    ++passed;
-
-    holons::close_connection(mem_server);
-    holons::close_connection(mem_client);
-    holons::close_listener(mem_lis);
 
     auto ws_lis = holons::listen("ws://127.0.0.1:8080/holon");
     auto *ws = std::get_if<holons::ws_listener>(&ws_lis);
